@@ -25,10 +25,9 @@ api_router = APIRouter(prefix="/api")
 
 # Config
 MAX_FILE_SIZE = 25 * 1024 * 1024  # OpenAI Whisper limit: 25 MB
-ALLOWED_EXTS = {"mp3", "wav", "m4a", "ogg", "flac", "webm", "mp4", "mpeg", "mpga"}
+ALLOWED_EXTS = {"mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"}
 
-# Whisper accepts: mp3, mp4, mpeg, mpga, m4a, wav, webm. We map ogg/flac -> we still send but may fail;
-# to maximize compatibility, we let API accept any of these and mp3/wav/m4a/webm are guaranteed.
+# Whisper (whisper-1) supports exactly: mp3, mp4, mpeg, mpga, m4a, wav, webm.
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

@@ -17,7 +17,7 @@ import { toast } from "sonner";
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
-const ALLOWED_EXT = ["mp3", "wav", "m4a", "ogg", "flac", "webm", "mp4", "mpeg", "mpga"];
+const ALLOWED_EXT = ["mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"];
 const MAX_SIZE_MB = 25;
 
 const formatBytes = (bytes) => {
@@ -252,7 +252,7 @@ export default function Transcriber() {
                   id="audio-input"
                   data-testid="audio-input"
                   type="file"
-                  accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac,.webm"
+                  accept="audio/*,.mp3,.wav,.m4a,.webm,.mp4,.mpeg,.mpga"
                   className="hidden"
                   onChange={onSelect}
                 />
@@ -449,7 +449,7 @@ export default function Transcriber() {
             {
               n: "02",
               t: "Çoklu Format",
-              d: "mp3, wav, m4a, ogg, flac, webm — hepsi tek arayüzden.",
+              d: "mp3, wav, m4a, webm, mp4 — hepsi tek arayüzden.",
             },
             {
               n: "03",
