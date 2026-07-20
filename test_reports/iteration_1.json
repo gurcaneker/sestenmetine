@@ -1,0 +1,58 @@
+{
+  "summary": "Full-stack testing of SesDeşifre (Turkish audio → text with OpenAI Whisper). Backend: 8/8 pytest tests passed including a REAL Whisper transcription of a JFK-style WAV that returned meaningful text. Frontend: dropzone, upload, progress bar, result panel, copy, download and reset flows all work end-to-end via Playwright with data-testid selectors. One real bug found: backend advertises .flac and .ogg support but the underlying emergentintegrations Whisper wrapper only supports mp3/mp4/mpeg/mpga/m4a/wav/webm — uploading .flac/.ogg returns HTTP 500 with a leaky provider error string.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/transcribe",
+        "issue": "ALLOWED_EXTS advertises 'flac' and 'ogg' (server.py L28) but the Whisper wrapper rejects them ⇒ 500 'Transkripsiyon başarısız: Validation error: Unsupported file format: flac. Supported formats: mp3, mp4, mpeg, mpga, m4a, wav, webm'. UI also shows these as accepted formats. Fix: either drop flac/ogg from ALLOWED_EXTS (backend + frontend + dropzone chip + accept attr) OR transcode server-side.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/transcribe",
+        "issue": "Provider validation errors are surfaced to the user unmodified in Turkish UI (leaks internal error text). Consider mapping provider validation errors to a friendlier Turkish 400 message before returning."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "File-format contract",
+        "issue": "Dropzone chip in Transcriber.jsx (L244) shows 'mp3 · wav · m4a · ogg · flac · webm' and ALLOWED_EXT (L20) accepts .ogg/.flac, but backend will 500 on those. User will experience opaque error after a full upload.",
+        "affected_selectors": ["[data-testid=\"upload-dropzone\"]", "[data-testid=\"audio-input\"]"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Decide flac/ogg policy: remove them from backend ALLOWED_EXTS (server.py) AND from frontend ALLOWED_EXT + dropzone hint + <input accept=…> in Transcriber.jsx, OR add server-side transcoding to wav before calling Whisper.",
+    "Wrap provider errors in a friendlier Turkish 400 for unsupported-by-provider formats instead of a raw 500 with provider text."
+  ],
+  "critical_code_review_comments": [
+    "server.py ALLOWED_EXTS is inconsistent with the actual Whisper-supported list — this is the root cause of the flac/ogg failure.",
+    "server.py catches generic Exception and returns 500 with str(e). This leaks provider internals into the client; should map known provider messages to 4xx.",
+    "Transcriber.jsx: ALLOWED_EXT constant is duplicated across the frontend (constant, accept attr, dropzone hint string) — move to a single source of truth.",
+    "server.py line 108: 'if language and 2 <= len(language) <= 5' then slices to [:2]. Bounds check is loose; OK for MVP but consider strict ISO-639-1 whitelist.",
+    "Frontend progress bar goes 0→70 during upload and jumps to 95→100 after the network completes; there is no genuine processing progress. Acceptable for MVP but user may perceive a stall at 70%."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_fixtures/jfk.wav",
+    "/app/test_fixtures/jfk.flac",
+    "/app/test_fixtures/sine.wav",
+    "/app/test_fixtures/make_wav.py"
+  ],
+  "success_rate": { "backend": "100%", "frontend": "100%" },
+  "test_credentials": "N/A - no auth in this app",
+  "seed_data_creation": "Downloaded LDC93S1.wav (jfk.wav) and openai/whisper jfk.flac into /app/test_fixtures/. Also generated sine.wav via /app/test_fixtures/make_wav.py.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite at /app/backend/tests/backend_test.py — 8 tests, ~5s runtime, includes REAL Whisper call on /app/test_fixtures/jfk.wav (expects English words dark/suit/greasy/etc.). If main agent removes flac/ogg from ALLOWED_EXTS, update TestTranscribeReal.test_transcribe_flac_reports_error_gracefully to expect 400 instead of 500. Fixtures live in /app/test_fixtures. EMERGENT_LLM_KEY is set in /app/backend/.env.",
+  "rca_of_the_issue": "server.py ALLOWED_EXTS = {mp3, wav, m4a, ogg, flac, webm, mp4, mpeg, mpga}. emergentintegrations.llm.openai.OpenAISpeechToText.transcribe() performs its own extension validation with only {mp3, mp4, mpeg, mpga, m4a, wav, webm}. Reproduction: `curl -F file=@sample.flac -F language=en $URL/api/transcribe` → 500 with detail containing 'Unsupported file format: flac'. Mitigation: (a) remove flac & ogg from both server ALLOWED_EXTS and frontend ALLOWED_EXT/accept/dropzone; (b) or transcode via pydub/ffmpeg on backend before invoking Whisper."
+}

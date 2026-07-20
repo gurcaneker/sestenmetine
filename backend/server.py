@@ -1,72 +1,128 @@
-from fastapi import FastAPI, APIRouter
+import os
+import io
+import logging
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
-import uuid
-from datetime import datetime, timezone
+
+from emergentintegrations.llm.openai import OpenAISpeechToText
 
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
+# MongoDB (kept from template, not used for MVP)
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Create the main app without a prefix
 app = FastAPI()
-
-# Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+# Config
+MAX_FILE_SIZE = 25 * 1024 * 1024  # OpenAI Whisper limit: 25 MB
+ALLOWED_EXTS = {"mp3", "wav", "m4a", "ogg", "flac", "webm", "mp4", "mpeg", "mpga"}
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+# Whisper accepts: mp3, mp4, mpeg, mpga, m4a, wav, webm. We map ogg/flac -> we still send but may fail;
+# to maximize compatibility, we let API accept any of these and mp3/wav/m4a/webm are guaranteed.
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# Add your routes to the router instead of directly to app
+
+def _get_ext(filename: str) -> str:
+    if not filename or '.' not in filename:
+        return ''
+    return filename.rsplit('.', 1)[-1].lower()
+
+
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "SesDeşifre API"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+@api_router.get("/health")
+async def health():
+    return {"status": "ok", "service": "transcription"}
 
-# Include the router in the main app
+
+@api_router.post("/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(default="tr"),
+):
+    """Transcribe an audio file using OpenAI Whisper.
+
+    - Supports mp3, wav, m4a, ogg, flac, webm, mp4, mpeg, mpga
+    - Max size: 25 MB
+    - `language` is a hint (ISO-639-1) to improve accuracy on low-quality audio
+    """
+    ext = _get_ext(file.filename or "")
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Desteklenmeyen dosya formatı: .{ext or 'bilinmiyor'}. "
+                   f"Kabul edilen: {', '.join(sorted(ALLOWED_EXTS))}",
+        )
+
+    contents = await file.read()
+    size = len(contents)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="Boş dosya yüklendi.")
+    if size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Dosya çok büyük ({size / (1024*1024):.1f} MB). Maksimum 25 MB.",
+        )
+
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Sunucu yapılandırma hatası: LLM anahtarı yok.")
+
+    try:
+        stt = OpenAISpeechToText(api_key=api_key)
+        # Wrap bytes as a file-like object with a name so OpenAI knows the format
+        buffer = io.BytesIO(contents)
+        buffer.name = file.filename or f"audio.{ext}"
+
+        # A short prompt hints Whisper that audio is noisy / low quality, and asks for cleaner text
+        prompt = (
+            "Bu ses dosyası düşük kaliteli, gürültülü veya düşük frekanslı olabilir. "
+            "Konuşmayı en doğru şekilde Türkçe metne dök."
+            if (language or "").lower().startswith("tr") else
+            "The audio may be low quality, noisy or low-frequency. Transcribe speech accurately."
+        )
+
+        kwargs = {
+            "file": buffer,
+            "model": "whisper-1",
+            "response_format": "json",
+            "temperature": 0.0,
+            "prompt": prompt,
+        }
+        # Only pass language if a valid ISO-639-1 code
+        if language and 2 <= len(language) <= 5:
+            kwargs["language"] = language.lower()[:2]
+
+        response = await stt.transcribe(**kwargs)
+        text = getattr(response, "text", None) or ""
+        return {
+            "text": text.strip(),
+            "language": kwargs.get("language"),
+            "filename": file.filename,
+            "size_bytes": size,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Transcription failed")
+        raise HTTPException(status_code=500, detail=f"Transkripsiyon başarısız: {str(e)}")
+
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -77,12 +133,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
