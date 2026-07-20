@@ -18,7 +18,7 @@ const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
 const ALLOWED_EXT = ["mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"];
-const MAX_SIZE_MB = 25;
+const MAX_SIZE_MB = 40;
 
 const formatBytes = (bytes) => {
   if (!bytes && bytes !== 0) return "-";
@@ -90,12 +90,12 @@ export default function Transcriber() {
         headers: { "Content-Type": "multipart/form-data" },
         onUploadProgress: (evt) => {
           if (evt.total) {
-            // Upload phase up to 70%, remainder simulates processing
-            const uploadPct = Math.round((evt.loaded / evt.total) * 70);
+            // Upload phase up to 60%, remainder simulates transcode + chunked transcription
+            const uploadPct = Math.round((evt.loaded / evt.total) * 60);
             setProgress(uploadPct);
           }
         },
-        timeout: 180000,
+        timeout: 30 * 60 * 1000, // 30 min for very large files
       });
       // Simulate processing tick to 95, then complete
       setProgress(95);
@@ -245,7 +245,7 @@ export default function Transcriber() {
                   </span>
                 </div>
                 <div className="mt-3 tech-label !text-[10px]">
-                  Maksimum boyut · {MAX_SIZE_MB} MB
+                  Maksimum boyut · {MAX_SIZE_MB} MB · Büyük dosyalar otomatik olarak parçalanır
                 </div>
                 <input
                   ref={inputRef}
@@ -288,6 +288,11 @@ export default function Transcriber() {
                       <span className="tech-label">
                         Format · .{getExt(file.name)}
                       </span>
+                      {file.size > 25 * 1024 * 1024 && (
+                        <span className="tech-label !text-[#002FA7]">
+                          Otomatik parçalama · Aktif
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -392,6 +397,7 @@ export default function Transcriber() {
                     </div>
                     <div className="tech-label mt-0.5">
                       {wordCount} kelime · {charCount} karakter
+                      {result.chunks > 1 && ` · ${result.chunks} parça`}
                     </div>
                   </div>
                 </div>

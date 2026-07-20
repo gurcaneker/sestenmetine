@@ -1,8 +1,10 @@
 import os
 import io
+import math
+import tempfile
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException
 from dotenv import load_dotenv
@@ -10,6 +12,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from emergentintegrations.llm.openai import OpenAISpeechToText
+from pydub import AudioSegment
 
 
 ROOT_DIR = Path(__file__).parent
@@ -23,8 +26,12 @@ db = client[os.environ['DB_NAME']]
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# Config
-MAX_FILE_SIZE = 25 * 1024 * 1024  # OpenAI Whisper limit: 25 MB
+# --- Config -----------------------------------------------------------------
+# Hard upload cap (server-side). Users can now upload much larger files;
+# we transcode/chunk down for Whisper.
+MAX_UPLOAD_SIZE = 500 * 1024 * 1024                # 500 MB accepted
+WHISPER_LIMIT = 25 * 1024 * 1024                   # OpenAI Whisper per-request limit
+CHUNK_TARGET_BYTES = 20 * 1024 * 1024              # keep each chunk safely under 25 MB
 ALLOWED_EXTS = {"mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"}
 
 # Whisper (whisper-1) supports exactly: mp3, mp4, mpeg, mpga, m4a, wav, webm.
@@ -37,6 +44,65 @@ def _get_ext(filename: str) -> str:
     if not filename or '.' not in filename:
         return ''
     return filename.rsplit('.', 1)[-1].lower()
+
+
+def _prepare_chunks(raw_bytes: bytes, ext: str) -> List[bytes]:
+    """Decode audio with pydub, downsample to mono 16 kHz MP3 (64 kbps),
+    and split into ≤ CHUNK_TARGET_BYTES pieces.
+
+    Returns a list of MP3 byte payloads ready to send to Whisper.
+    """
+    # pydub uses file extension hints; write to a temp file so it can detect containers
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+        tmp.write(raw_bytes)
+        tmp_path = tmp.name
+    try:
+        audio: AudioSegment = AudioSegment.from_file(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # Normalize for smaller size and better low-quality speech recognition
+    audio = audio.set_channels(1).set_frame_rate(16000)
+
+    duration_ms = len(audio)
+    if duration_ms <= 0:
+        raise HTTPException(status_code=400, detail="Ses dosyasında geçerli içerik bulunamadı.")
+
+    # Encode once to gauge bitrate/size
+    def _export_mp3(seg: AudioSegment) -> bytes:
+        buf = io.BytesIO()
+        seg.export(buf, format="mp3", bitrate="64k", parameters=["-ac", "1"])
+        return buf.getvalue()
+
+    full = _export_mp3(audio)
+    if len(full) <= CHUNK_TARGET_BYTES:
+        return [full]
+
+    # Determine chunk duration based on encoded bitrate
+    # bytes_per_ms ≈ len(full) / duration_ms
+    bytes_per_ms = len(full) / duration_ms
+    chunk_ms = int(CHUNK_TARGET_BYTES / bytes_per_ms * 0.95)  # 5% safety margin
+    # never smaller than 30 s
+    chunk_ms = max(chunk_ms, 30_000)
+
+    chunks: List[bytes] = []
+    num_chunks = math.ceil(duration_ms / chunk_ms)
+    for i in range(num_chunks):
+        start = i * chunk_ms
+        end = min(start + chunk_ms, duration_ms)
+        segment = audio[start:end]
+        payload = _export_mp3(segment)
+        # If somehow still too big, re-split that piece in half recursively (rare)
+        if len(payload) > WHISPER_LIMIT:
+            half = (end - start) // 2
+            for sub in (audio[start:start + half], audio[start + half:end]):
+                chunks.append(_export_mp3(sub))
+        else:
+            chunks.append(payload)
+    return chunks
 
 
 @api_router.get("/")
@@ -56,9 +122,11 @@ async def transcribe_audio(
 ):
     """Transcribe an audio file using OpenAI Whisper.
 
-    - Supports mp3, wav, m4a, ogg, flac, webm, mp4, mpeg, mpga
-    - Max size: 25 MB
-    - `language` is a hint (ISO-639-1) to improve accuracy on low-quality audio
+    - Supports mp3, wav, m4a, webm, mp4, mpeg, mpga
+    - Server accepts up to 500 MB; large files are automatically transcoded
+      (mono / 16 kHz / MP3 64 kbps) and chunked into ≤ 20 MB pieces before
+      being sent to Whisper (per-request 25 MB limit).
+    - `language` is a hint (ISO-639-1) to improve accuracy on low-quality audio.
     """
     ext = _get_ext(file.filename or "")
     if ext not in ALLOWED_EXTS:
@@ -72,54 +140,82 @@ async def transcribe_audio(
     size = len(contents)
     if size == 0:
         raise HTTPException(status_code=400, detail="Boş dosya yüklendi.")
-    if size > MAX_FILE_SIZE:
+    if size > MAX_UPLOAD_SIZE:
         raise HTTPException(
             status_code=413,
-            detail=f"Dosya çok büyük ({size / (1024*1024):.1f} MB). Maksimum 25 MB.",
+            detail=f"Dosya çok büyük ({size / (1024*1024):.1f} MB). "
+                   f"Maksimum {MAX_UPLOAD_SIZE // (1024*1024)} MB.",
         )
 
     api_key = os.environ.get("EMERGENT_LLM_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="Sunucu yapılandırma hatası: LLM anahtarı yok.")
 
+    prompt = (
+        "Bu ses dosyası düşük kaliteli, gürültülü veya düşük frekanslı olabilir. "
+        "Konuşmayı en doğru şekilde Türkçe metne dök."
+        if (language or "").lower().startswith("tr") else
+        "The audio may be low quality, noisy or low-frequency. Transcribe speech accurately."
+    )
+    lang_code = None
+    if language and 2 <= len(language) <= 5:
+        lang_code = language.lower()[:2]
+
+    # Decide whether we need to transcode/chunk
     try:
-        stt = OpenAISpeechToText(api_key=api_key)
-        # Wrap bytes as a file-like object with a name so OpenAI knows the format
-        buffer = io.BytesIO(contents)
-        buffer.name = file.filename or f"audio.{ext}"
+        if size <= WHISPER_LIMIT:
+            # Fast path: send original bytes untouched
+            chunks: List[bytes] = [contents]
+            chunk_ext = ext
+        else:
+            logger.info("Large file (%.1f MB) — transcoding & chunking with ffmpeg", size / (1024 * 1024))
+            chunks = _prepare_chunks(contents, ext)
+            chunk_ext = "mp3"
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Chunking failed")
+        raise HTTPException(status_code=400, detail=f"Ses dosyası çözümlenemedi: {str(e)}")
 
-        # A short prompt hints Whisper that audio is noisy / low quality, and asks for cleaner text
-        prompt = (
-            "Bu ses dosyası düşük kaliteli, gürültülü veya düşük frekanslı olabilir. "
-            "Konuşmayı en doğru şekilde Türkçe metne dök."
-            if (language or "").lower().startswith("tr") else
-            "The audio may be low quality, noisy or low-frequency. Transcribe speech accurately."
-        )
+    stt = OpenAISpeechToText(api_key=api_key)
+    texts: List[str] = []
 
-        kwargs = {
-            "file": buffer,
-            "model": "whisper-1",
-            "response_format": "json",
-            "temperature": 0.0,
-            "prompt": prompt,
-        }
-        # Only pass language if a valid ISO-639-1 code
-        if language and 2 <= len(language) <= 5:
-            kwargs["language"] = language.lower()[:2]
+    try:
+        for idx, chunk_bytes in enumerate(chunks):
+            buffer = io.BytesIO(chunk_bytes)
+            buffer.name = (
+                (file.filename or f"audio.{chunk_ext}")
+                if len(chunks) == 1
+                else f"chunk_{idx + 1}.{chunk_ext}"
+            )
 
-        response = await stt.transcribe(**kwargs)
-        text = getattr(response, "text", None) or ""
-        return {
-            "text": text.strip(),
-            "language": kwargs.get("language"),
-            "filename": file.filename,
-            "size_bytes": size,
-        }
+            kwargs = {
+                "file": buffer,
+                "model": "whisper-1",
+                "response_format": "json",
+                "temperature": 0.0,
+                "prompt": prompt,
+            }
+            if lang_code:
+                kwargs["language"] = lang_code
+
+            response = await stt.transcribe(**kwargs)
+            piece = (getattr(response, "text", None) or "").strip()
+            if piece:
+                texts.append(piece)
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=f"Transkripsiyon başarısız: {str(e)}")
+
+    return {
+        "text": " ".join(texts).strip(),
+        "language": lang_code,
+        "filename": file.filename,
+        "size_bytes": size,
+        "chunks": len(chunks),
+    }
 
 
 app.include_router(api_router)
