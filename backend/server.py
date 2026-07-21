@@ -32,9 +32,27 @@ api_router = APIRouter(prefix="/api")
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024                # 500 MB accepted
 WHISPER_LIMIT = 25 * 1024 * 1024                   # OpenAI Whisper per-request limit
 CHUNK_TARGET_BYTES = 20 * 1024 * 1024              # keep each chunk safely under 25 MB
-ALLOWED_EXTS = {"mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"}
+# Formats natively accepted by OpenAI Whisper (no transcode needed)
+WHISPER_NATIVE_EXTS = {"mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"}
 
-# Whisper (whisper-1) supports exactly: mp3, mp4, mpeg, mpga, m4a, wav, webm.
+# Additional audio containers we accept — ffmpeg/pydub decodes then we transcode to MP3
+EXTRA_AUDIO_EXTS = {
+    "flac", "ogg", "oga", "opus", "aac", "wma",
+    "aiff", "aif", "aifc", "amr", "ac3", "au", "caf",
+    "3ga", "voc", "ra", "mka", "dts", "wv", "mp2",
+}
+
+# Video containers — audio track is extracted with ffmpeg and transcribed
+VIDEO_EXTS = {
+    "mov", "avi", "mkv", "wmv", "flv", "3gp", "3g2",
+    "m4v", "mpg", "mpe", "vob", "ogv", "mts", "m2ts",
+    "ts", "asf", "rm", "rmvb", "f4v", "divx", "xvid",
+}
+
+ALLOWED_EXTS = WHISPER_NATIVE_EXTS | EXTRA_AUDIO_EXTS | VIDEO_EXTS
+
+# Whisper (whisper-1) supports natively: mp3, mp4, mpeg, mpga, m4a, wav, webm.
+# Everything else is decoded via ffmpeg/pydub and re-encoded to MP3 before Whisper.
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -120,20 +138,25 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     language: Optional[str] = Form(default="tr"),
 ):
-    """Transcribe an audio file using OpenAI Whisper.
+    """Transcribe an audio (or video) file using OpenAI Whisper.
 
-    - Supports mp3, wav, m4a, webm, mp4, mpeg, mpga
-    - Server accepts up to 500 MB; large files are automatically transcoded
-      (mono / 16 kHz / MP3 64 kbps) and chunked into ≤ 20 MB pieces before
-      being sent to Whisper (per-request 25 MB limit).
+    - Accepts most audio and video formats (mp3, wav, m4a, webm, flac, ogg, opus,
+      aac, wma, aiff, amr, mov, avi, mkv, mp4, wmv, flv, 3gp, mkv, mpg, …).
+      Non-native formats are transparently decoded/transcoded with ffmpeg; for
+      video inputs, only the audio track is used.
+    - Server accepts up to 500 MB; files that don't natively fit Whisper are
+      transcoded (mono / 16 kHz / MP3 64 kbps) and chunked into ≤ 20 MB pieces
+      before being sent to Whisper (per-request 25 MB limit).
     - `language` is a hint (ISO-639-1) to improve accuracy on low-quality audio.
     """
     ext = _get_ext(file.filename or "")
     if ext not in ALLOWED_EXTS:
+        # Give a shorter, friendlier list in the error (natively-common formats)
+        friendly = "mp3, wav, m4a, webm, mp4, flac, ogg, opus, aac, mov, avi, mkv, wmv, flv, 3gp, mkv …"
         raise HTTPException(
             status_code=400,
             detail=f"Desteklenmeyen dosya formatı: .{ext or 'bilinmiyor'}. "
-                   f"Kabul edilen: {', '.join(sorted(ALLOWED_EXTS))}",
+                   f"Örnek kabul edilen formatlar: {friendly}",
         )
 
     contents = await file.read()
@@ -162,13 +185,19 @@ async def transcribe_audio(
         lang_code = language.lower()[:2]
 
     # Decide whether we need to transcode/chunk
+    is_video = ext in VIDEO_EXTS
+    needs_transcode = (ext not in WHISPER_NATIVE_EXTS) or (size > WHISPER_LIMIT)
+
     try:
-        if size <= WHISPER_LIMIT:
+        if not needs_transcode:
             # Fast path: send original bytes untouched
             chunks: List[bytes] = [contents]
             chunk_ext = ext
         else:
-            logger.info("Large file (%.1f MB) — transcoding & chunking with ffmpeg", size / (1024 * 1024))
+            logger.info(
+                "Transcoding via ffmpeg (video=%s, size=%.1f MB, ext=%s)",
+                is_video, size / (1024 * 1024), ext,
+            )
             chunks = _prepare_chunks(contents, ext)
             chunk_ext = "mp3"
     except HTTPException:
@@ -183,11 +212,13 @@ async def transcribe_audio(
     try:
         for idx, chunk_bytes in enumerate(chunks):
             buffer = io.BytesIO(chunk_bytes)
-            buffer.name = (
-                (file.filename or f"audio.{chunk_ext}")
-                if len(chunks) == 1
-                else f"chunk_{idx + 1}.{chunk_ext}"
-            )
+            if chunk_ext == ext:
+                # Fast path: keep original filename so Whisper sees the same extension
+                buffer.name = file.filename or f"audio.{chunk_ext}"
+            elif len(chunks) == 1:
+                buffer.name = f"audio.{chunk_ext}"
+            else:
+                buffer.name = f"chunk_{idx + 1}.{chunk_ext}"
 
             kwargs = {
                 "file": buffer,
@@ -215,6 +246,7 @@ async def transcribe_audio(
         "filename": file.filename,
         "size_bytes": size,
         "chunks": len(chunks),
+        "is_video": is_video,
     }
 
 

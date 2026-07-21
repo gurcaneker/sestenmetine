@@ -17,7 +17,23 @@ import { toast } from "sonner";
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
-const ALLOWED_EXT = ["mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"];
+// Native Whisper formats
+const AUDIO_NATIVE = ["mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"];
+// Extra audio containers (server transcodes via ffmpeg)
+const AUDIO_EXTRA = [
+  "flac", "ogg", "oga", "opus", "aac", "wma",
+  "aiff", "aif", "aifc", "amr", "ac3", "au", "caf",
+  "3ga", "voc", "mka", "mp2",
+];
+// Video containers (server extracts audio track)
+const VIDEO_EXT = [
+  "mov", "avi", "mkv", "wmv", "flv", "3gp", "3g2",
+  "m4v", "mpg", "mpe", "vob", "ogv", "mts", "m2ts",
+  "ts", "asf", "f4v",
+];
+const ALLOWED_EXT = [...AUDIO_NATIVE, ...AUDIO_EXTRA, ...VIDEO_EXT];
+const VIDEO_SET = new Set(VIDEO_EXT);
+const ACCEPT_ATTR = "audio/*,video/*," + ALLOWED_EXT.map((e) => `.${e}`).join(",");
 const MAX_SIZE_MB = 40;
 
 const formatBytes = (bytes) => {
@@ -233,26 +249,34 @@ export default function Transcriber() {
                   <UploadCloud className="w-7 h-7" />
                 </div>
                 <div className="font-display font-bold text-xl md:text-2xl tracking-tight mb-2">
-                  Ses dosyasını buraya sürükleyin
+                  Ses veya video dosyasını buraya sürükleyin
                 </div>
                 <div className="text-sm text-gray-600 mb-6">
                   veya seçmek için tıklayın
                 </div>
-                <div className="inline-flex items-center gap-2 border border-black/15 bg-[#FAFAFA] px-3 py-1.5">
-                  <span className="tech-label !text-[10px]">Desteklenen</span>
-                  <span className="font-mono text-xs">
-                    {ALLOWED_EXT.slice(0, 6).join(" · ")}
-                  </span>
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  <div className="inline-flex items-center gap-2 border border-black/15 bg-[#FAFAFA] px-3 py-1.5">
+                    <span className="tech-label !text-[10px]">Ses</span>
+                    <span className="font-mono text-xs">
+                      mp3 · wav · m4a · flac · ogg · opus · aac …
+                    </span>
+                  </div>
+                  <div className="inline-flex items-center gap-2 border border-black/15 bg-[#FAFAFA] px-3 py-1.5">
+                    <span className="tech-label !text-[10px]">Video</span>
+                    <span className="font-mono text-xs">
+                      mp4 · mov · mkv · avi · webm · flv …
+                    </span>
+                  </div>
                 </div>
                 <div className="mt-3 tech-label !text-[10px]">
-                  Maksimum boyut · {MAX_SIZE_MB} MB · Büyük dosyalar otomatik olarak parçalanır
+                  Maks · {MAX_SIZE_MB} MB · Videodan ses otomatik ayıklanır · Büyükler parçalanır
                 </div>
                 <input
                   ref={inputRef}
                   id="audio-input"
                   data-testid="audio-input"
                   type="file"
-                  accept="audio/*,.mp3,.wav,.m4a,.webm,.mp4,.mpeg,.mpga"
+                  accept={ACCEPT_ATTR}
                   className="hidden"
                   onChange={onSelect}
                 />
@@ -288,6 +312,11 @@ export default function Transcriber() {
                       <span className="tech-label">
                         Format · .{getExt(file.name)}
                       </span>
+                      {VIDEO_SET.has(getExt(file.name)) && (
+                        <span className="tech-label !text-[#002FA7]">
+                          Video · Ses ayıklanacak
+                        </span>
+                      )}
                       {file.size > 25 * 1024 * 1024 && (
                         <span className="tech-label !text-[#002FA7]">
                           Otomatik parçalama · Aktif
@@ -455,7 +484,7 @@ export default function Transcriber() {
             {
               n: "02",
               t: "Çoklu Format",
-              d: "mp3, wav, m4a, webm, mp4 — hepsi tek arayüzden.",
+              d: "Ses (mp3, wav, flac, ogg, opus…) ve video (mp4, mov, mkv…) — hepsi otomatik.",
             },
             {
               n: "03",
