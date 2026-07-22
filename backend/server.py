@@ -2,6 +2,7 @@ import os
 import io
 import math
 import tempfile
+import uuid
 import logging
 from pathlib import Path
 from typing import Optional, List
@@ -12,6 +13,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from emergentintegrations.llm.openai import OpenAISpeechToText
+from emergentintegrations.llm.chat import LlmChat, UserMessage
 from pydub import AudioSegment
 
 
@@ -121,6 +123,52 @@ def _prepare_chunks(raw_bytes: bytes, ext: str) -> List[bytes]:
         else:
             chunks.append(payload)
     return chunks
+
+
+async def _diarize_with_claude(raw_text: str, api_key: str) -> Optional[str]:
+    """Use Claude to detect speaker turns from the raw transcript and produce
+    a labeled version like "1. kişi: … / 2. kişi: …".
+
+    Returns None if the LLM says there is only a single speaker or if the call
+    fails. Never raises to the caller.
+    """
+    text = (raw_text or "").strip()
+    if len(text) < 40:  # too short to meaningfully diarize
+        return None
+
+    system_msg = (
+        "Sen bir konuşma çözümleme asistanısın. Sana Whisper tarafından "
+        "üretilmiş bir Türkçe transkripsiyon veriliyor. Görevin: metindeki "
+        "konuşmacı değişimlerini içerik ipuçlarından (soru-cevap, hitap, "
+        "üslup, konu değişimi) tespit etmek ve konuşmayı '1. kişi:', "
+        "'2. kişi:' vb. etiketlerle satır satır yeniden yazmak.\n\n"
+        "Kurallar:\n"
+        "- Sadece etiketli konuşmayı döndür, başka açıklama ekleme.\n"
+        "- Her konuşmacı değişiminde yeni satıra geç. Aynı konuşmacı "
+        "devam ediyorsa satırları birleştir.\n"
+        "- Konuşmacı sayısını olduğu kadar tut; uydurma yeni konuşmacı ekleme.\n"
+        "- Eğer metinde açıkça tek bir konuşmacı varsa (monolog), tam olarak "
+        "şu tek kelimeyi döndür: TEK_KONUSMACI\n"
+        "- Metin içeriğini değiştirme; sadece konuşmacılara göre böl ve "
+        "gerekirse noktalama düzelt."
+    )
+    user_msg = UserMessage(text=text)
+
+    try:
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=f"diarize-{uuid.uuid4()}",
+            system_message=system_msg,
+        ).with_model("anthropic", "claude-sonnet-4-6")
+
+        reply = await chat.send_message(user_msg)
+        reply_text = (reply or "").strip()
+        if not reply_text or reply_text.upper().startswith("TEK_KONUSMACI"):
+            return None
+        return reply_text
+    except Exception:
+        logger.exception("Diarization failed")
+        return None
 
 
 @api_router.get("/")
@@ -240,8 +288,12 @@ async def transcribe_audio(
         logger.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=f"Transkripsiyon başarısız: {str(e)}")
 
+    raw_text = " ".join(texts).strip()
+    diarized_text = await _diarize_with_claude(raw_text, api_key)
+
     return {
-        "text": " ".join(texts).strip(),
+        "text": raw_text,
+        "diarized_text": diarized_text,
         "language": lang_code,
         "filename": file.filename,
         "size_bytes": size,

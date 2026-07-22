@@ -11,6 +11,8 @@ import {
   RotateCcw,
   Waves,
   CheckCircle2,
+  Users,
+  FileText,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -49,8 +51,9 @@ export default function Transcriber() {
   const [file, setFile] = useState(null);
   const [status, setStatus] = useState("idle"); // idle | uploading | done | error
   const [progress, setProgress] = useState(0);
-  const [result, setResult] = useState(null); // {text, language, filename, size_bytes}
+  const [result, setResult] = useState(null); // {text, diarized_text, language, filename, size_bytes}
   const [error, setError] = useState(null);
+  const [showDiarized, setShowDiarized] = useState(true);
   const inputRef = useRef(null);
   const [dragOver, setDragOver] = useState(false);
 
@@ -138,10 +141,18 @@ export default function Transcriber() {
     setProgress(0);
   };
 
+  const activeText = useMemo(() => {
+    if (!result) return "";
+    if (showDiarized && result.diarized_text) return result.diarized_text;
+    return result.text || "";
+  }, [result, showDiarized]);
+
+  const hasDiarization = Boolean(result?.diarized_text);
+
   const copyText = async () => {
-    if (!result?.text) return;
+    if (!activeText) return;
     try {
-      await navigator.clipboard.writeText(result.text);
+      await navigator.clipboard.writeText(activeText);
       toast.success("Panoya kopyalandı");
     } catch {
       toast.error("Kopyalanamadı");
@@ -149,26 +160,34 @@ export default function Transcriber() {
   };
 
   const downloadTxt = () => {
-    if (!result?.text) return;
-    const blob = new Blob([result.text], { type: "text/plain;charset=utf-8" });
+    if (!activeText) return;
+    const blob = new Blob([activeText], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     const base = (result.filename || "transkripsiyon").replace(/\.[^.]+$/, "");
-    a.download = `${base}.txt`;
+    const suffix = showDiarized && hasDiarization ? "-konusmacilar" : "";
+    a.download = `${base}${suffix}.txt`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-    toast.success("İndirildi", { description: `${base}.txt` });
+    toast.success("İndirildi", { description: `${base}${suffix}.txt` });
   };
 
   const wordCount = useMemo(() => {
-    if (!result?.text) return 0;
-    return result.text.trim().split(/\s+/).filter(Boolean).length;
-  }, [result]);
+    if (!activeText) return 0;
+    return activeText.trim().split(/\s+/).filter(Boolean).length;
+  }, [activeText]);
 
-  const charCount = result?.text?.length || 0;
+  const charCount = activeText.length || 0;
+
+  const speakerCount = useMemo(() => {
+    if (!result?.diarized_text) return 0;
+    const matches = result.diarized_text.match(/(\d+)\.\s*kişi\s*:/gi) || [];
+    const seen = new Set(matches.map((m) => m.match(/\d+/)[0]));
+    return seen.size;
+  }, [result]);
 
   return (
     <div className="min-h-screen w-full bg-[#FAFAFA] text-[#111827]">
@@ -427,6 +446,7 @@ export default function Transcriber() {
                     <div className="tech-label mt-0.5">
                       {wordCount} kelime · {charCount} karakter
                       {result.chunks > 1 && ` · ${result.chunks} parça`}
+                      {hasDiarization && speakerCount > 0 && ` · ${speakerCount} konuşmacı`}
                     </div>
                   </div>
                 </div>
@@ -439,12 +459,50 @@ export default function Transcriber() {
                 </button>
               </div>
 
+              {hasDiarization && (
+                <div
+                  className="mt-5 inline-flex border border-black/15 bg-[#FAFAFA]"
+                  data-testid="view-toggle"
+                >
+                  <button
+                    onClick={() => setShowDiarized(true)}
+                    className={`px-4 py-2 tech-label !text-[10px] flex items-center gap-2 transition-colors ${
+                      showDiarized
+                        ? "bg-black text-white"
+                        : "text-gray-700 hover:bg-black/5"
+                    }`}
+                    data-testid="toggle-diarized-btn"
+                  >
+                    <Users className="w-3.5 h-3.5" />
+                    Konuşmacılara Ayrılmış
+                  </button>
+                  <button
+                    onClick={() => setShowDiarized(false)}
+                    className={`px-4 py-2 tech-label !text-[10px] flex items-center gap-2 transition-colors border-l border-black/15 ${
+                      !showDiarized
+                        ? "bg-black text-white"
+                        : "text-gray-700 hover:bg-black/5"
+                    }`}
+                    data-testid="toggle-raw-btn"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    Düz Metin
+                  </button>
+                </div>
+              )}
+
               <div
                 aria-live="polite"
                 data-testid="transcription-text"
                 className="mt-6 leading-relaxed text-[15px] text-gray-800 max-h-[52vh] overflow-y-auto custom-scrollbar text-left whitespace-pre-wrap break-words border-l-2 border-black/10 pl-4"
               >
-                {result.text || (
+                {activeText ? (
+                  showDiarized && hasDiarization ? (
+                    <DiarizedText text={activeText} />
+                  ) : (
+                    activeText
+                  )
+                ) : (
                   <span className="text-gray-500 italic">
                     (Ses içerisinde metne çevrilebilir konuşma bulunamadı.)
                   </span>
@@ -507,6 +565,56 @@ export default function Transcriber() {
           <div className="tech-label">© {new Date().getFullYear()}</div>
         </div>
       </footer>
+    </div>
+  );
+}
+
+
+// Renders diarized text: each "N. kişi:" prefix becomes a labeled block with
+// a distinct color per speaker.
+const SPEAKER_COLORS = [
+  "#002FA7", // Klein blue
+  "#B32218", // deep red
+  "#0F766E", // teal
+  "#7C2D12", // burnt orange
+  "#4C1D95", // deep purple
+  "#365314", // olive
+];
+
+function DiarizedText({ text }) {
+  const lines = text
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  return (
+    <div className="space-y-4">
+      {lines.map((line, i) => {
+        const match = line.match(/^(\d+)\.\s*kişi\s*:\s*(.*)$/i);
+        if (!match) {
+          return (
+            <p key={i} className="text-gray-800">
+              {line}
+            </p>
+          );
+        }
+        const num = parseInt(match[1], 10);
+        const body = match[2];
+        const color = SPEAKER_COLORS[(num - 1) % SPEAKER_COLORS.length];
+        return (
+          <div key={i} className="flex gap-3">
+            <div className="flex-shrink-0 pt-0.5">
+              <span
+                className="tech-label !text-[10px] !text-white px-2 py-1 inline-block"
+                style={{ backgroundColor: color }}
+              >
+                {num}. kişi
+              </span>
+            </div>
+            <p className="text-gray-800 flex-1 leading-relaxed">{body}</p>
+          </div>
+        );
+      })}
     </div>
   );
 }
