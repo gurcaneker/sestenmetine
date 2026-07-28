@@ -157,6 +157,16 @@ Yukarıdaki HF_TOKEN adımları diarization şu an kapalıyken de geçerli:
 (ileride tekrar açılabilmesi için bilinçli olarak kaldırılmadı — bkz.
 yukarıdaki devre dışı bırakma notu).
 
+**Her istekte hız/doğruluk seçimi (`quality_mode`):** `/api/transcribe`'a
+opsiyonel bir form alanı gönderebilirsiniz — `quality_mode=standard`
+(varsayılan, `WHISPER_MODEL_SIZE`'ı kullanır) veya `quality_mode=precise`
+(her zaman `large-v3-turbo`, env'den bağımsız — ~3x daha yavaş ama bazı
+zor/gürültülü kayıtlarda daha doğru, bkz. `BENCHMARK.md` "Bulgu 4"). Frontend
+bunu "Hızlı (standart)" / "Hassas" iki buton olarak sunuyor, varsayılan
+Hızlı. İki model de aynı anda belleğe yüklenmez — her biri sadece fiilen
+talep edildiğinde yüklenip cache'lenir, aynı moddaki sonraki istekler
+yeniden yükleme maliyeti ödemez.
+
 Diarization yeniden açıldığında geçerli olacak davranış (kod hazır, aşağıdaki
 gibi uçtan uca doğrulandı): pipeline yüklenemez/başarısız olursa istek
 **başarısız olmaz** — `_diarize_with_claude`'un API-mode'daki davranışıyla

@@ -156,7 +156,7 @@ class TestLocalPipelineMocked:
         fake_module.BatchedInferencePipeline = MagicMock(return_value=fake_pipeline_instance)
 
         with patch.dict(sys.modules, {"faster_whisper": fake_module}):
-            raw_text, segments = server._transcribe_local(b"fake audio bytes", "wav", "tr")
+            raw_text, segments = server._transcribe_local(b"fake audio bytes", "wav", "tr", "standard")
 
         fake_module.WhisperModel.assert_called_once_with(
             server.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8",
@@ -218,6 +218,153 @@ class TestLocalPipelineMocked:
         )
         fake_pipeline_instance.assert_called_once_with(fake_waveform_dict)
         assert segments == [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}]
+
+
+class TestQualityMode:
+    """quality_mode ("standard"/"precise") selects which faster-whisper model
+    size is used in local mode, and each mode's model/pipeline is cached
+    separately so repeat requests in the same mode don't pay reload cost —
+    but a request for one mode never loads the other (see
+    _get_local_whisper_model's docstring)."""
+
+    def test_standard_resolves_to_whisper_model_size(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        assert server._model_size_for_quality("standard") == server.WHISPER_MODEL_SIZE
+
+    def test_precise_resolves_to_large_v3_turbo_regardless_of_env(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        monkeypatch.setenv("WHISPER_MODEL_SIZE", "tiny")
+        server = _reload_server()
+        assert server.WHISPER_MODEL_SIZE == "tiny"
+        assert server._model_size_for_quality("precise") == "large-v3-turbo"
+        assert server._model_size_for_quality("precise") != server.WHISPER_MODEL_SIZE
+
+    def test_get_local_whisper_model_uses_correct_size_per_quality_mode(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        fake_module = types.ModuleType("faster_whisper")
+        fake_module.WhisperModel = MagicMock(side_effect=lambda size, **kw: MagicMock(name=size))
+
+        with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+            server._get_local_whisper_model("standard")
+            server._get_local_whisper_model("precise")
+
+        assert fake_module.WhisperModel.call_count == 2
+        sizes_requested = [c.args[0] for c in fake_module.WhisperModel.call_args_list]
+        assert sizes_requested == [server.WHISPER_MODEL_SIZE, "large-v3-turbo"]
+
+    def test_models_cached_separately_no_reload_on_repeat_same_mode(self, monkeypatch):
+        """Two calls with the SAME quality_mode must reuse the cached model
+        (only one WhisperModel() construction) — this is the "don't pay
+        reload cost for repeat requests in the same mode" requirement."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        fake_module = types.ModuleType("faster_whisper")
+        fake_module.WhisperModel = MagicMock(side_effect=lambda size, **kw: MagicMock(name=size))
+
+        with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+            m1 = server._get_local_whisper_model("standard")
+            m2 = server._get_local_whisper_model("standard")
+
+        assert fake_module.WhisperModel.call_count == 1
+        assert m1 is m2
+
+    def test_requesting_only_standard_never_loads_precise_model(self, monkeypatch):
+        """RAM requirement: the OTHER mode's model must not be constructed
+        just because one mode was requested."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        fake_module = types.ModuleType("faster_whisper")
+        fake_module.WhisperModel = MagicMock(side_effect=lambda size, **kw: MagicMock(name=size))
+
+        with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+            server._get_local_whisper_model("standard")
+
+        assert fake_module.WhisperModel.call_count == 1
+        assert "precise" not in server._local_whisper_models
+        assert "standard" in server._local_whisper_models
+
+    def test_transcribe_local_passes_quality_mode_to_pipeline_cache(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        fake_segment = MagicMock(start=0.0, end=1.0, text="hi")
+        fake_pipeline_instance = MagicMock()
+        fake_pipeline_instance.transcribe.return_value = ([fake_segment], MagicMock())
+        fake_module = types.ModuleType("faster_whisper")
+        fake_module.WhisperModel = MagicMock(side_effect=lambda size, **kw: MagicMock(name=size))
+        fake_module.BatchedInferencePipeline = MagicMock(return_value=fake_pipeline_instance)
+
+        with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+            server._transcribe_local(b"fake audio bytes", "wav", "tr", "precise")
+
+        fake_module.WhisperModel.assert_called_once_with(
+            "large-v3-turbo", device="cpu", compute_type="int8",
+            cpu_threads=server._local_cpu_threads(),
+        )
+        assert "precise" in server._local_whisper_pipelines
+
+    def test_endpoint_forwards_precise_quality_mode_to_transcribe_local(self, monkeypatch):
+        """End-to-end through the actual /api/transcribe route (not just the
+        function directly): quality_mode="precise" in the form data must
+        reach _transcribe_local as "precise"."""
+        from fastapi.testclient import TestClient
+
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        with patch.object(server, "_verify_media_stream"), patch.object(
+            server, "_transcribe_local", return_value=("hi", [])
+        ) as mock_transcribe:
+            client = TestClient(server.app)
+            resp = client.post(
+                "/api/transcribe",
+                headers={"X-API-Key": "test-key"},
+                files={"file": ("test.wav", b"fake wav bytes", "audio/wav")},
+                data={"quality_mode": "precise"},
+            )
+
+        assert resp.status_code == 200
+        mock_transcribe.assert_called_once_with(b"fake wav bytes", "wav", "tr", "precise")
+
+    def test_endpoint_defaults_to_standard_quality_mode(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        with patch.object(server, "_verify_media_stream"), patch.object(
+            server, "_transcribe_local", return_value=("hi", [])
+        ) as mock_transcribe:
+            client = TestClient(server.app)
+            resp = client.post(
+                "/api/transcribe",
+                headers={"X-API-Key": "test-key"},
+                files={"file": ("test.wav", b"fake wav bytes", "audio/wav")},
+            )
+
+        assert resp.status_code == 200
+        mock_transcribe.assert_called_once_with(b"fake wav bytes", "wav", "tr", "standard")
+
+    def test_endpoint_rejects_invalid_quality_mode(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        client = TestClient(server.app)
+        resp = client.post(
+            "/api/transcribe",
+            headers={"X-API-Key": "test-key"},
+            files={"file": ("test.wav", b"fake wav bytes", "audio/wav")},
+            data={"quality_mode": "ultra-fast"},
+        )
+        assert resp.status_code == 400
+        assert "quality_mode" in resp.json()["detail"]
 
 
 class TestLocalModeDiarizationDisabled:

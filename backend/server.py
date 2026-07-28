@@ -56,6 +56,15 @@ WHISPER_MODEL_SIZE = os.environ.get('WHISPER_MODEL_SIZE', 'small')
 # real-world recordings without ballooning memory. See BENCHMARK.md.
 WHISPER_BATCH_SIZE = int(os.environ.get('WHISPER_BATCH_SIZE', '8'))
 
+# Per-request quality/speed trade-off for local mode (see /api/transcribe's
+# quality_mode form field). "precise" always means large-v3-turbo, regardless
+# of WHISPER_MODEL_SIZE — benchmarked at ~3x slower than 'small' but more
+# accurate on harder/noisier audio in some cases, see BENCHMARK.md "Bulgu 4".
+QUALITY_MODE_STANDARD = "standard"
+QUALITY_MODE_PRECISE = "precise"
+QUALITY_MODES = (QUALITY_MODE_STANDARD, QUALITY_MODE_PRECISE)
+PRECISE_MODEL_SIZE = "large-v3-turbo"
+
 HF_TOKEN = os.environ.get('HF_TOKEN')
 if TRANSCRIPTION_BACKEND == 'local' and not HF_TOKEN:
     raise RuntimeError(
@@ -317,8 +326,8 @@ async def _diarize_with_claude(raw_text: str, api_key: str) -> Optional[str]:
 # that never ran `pip install faster-whisper pyannote.audio`. Models are
 # loaded once and cached in these module-level globals (loading a Whisper/
 # pyannote model takes real time — must not happen per-request).
-_local_whisper_model = None
-_local_whisper_pipeline = None
+_local_whisper_models: dict = {}     # quality_mode -> WhisperModel
+_local_whisper_pipelines: dict = {}  # quality_mode -> BatchedInferencePipeline
 _local_diarization_pipeline = None
 
 
@@ -341,31 +350,45 @@ def _local_cpu_threads() -> int:
         return os.cpu_count() or 4  # sched_getaffinity is Linux-only
 
 
-def _get_local_whisper_model():
-    """Lazily load (and cache) the local faster-whisper model.
+def _model_size_for_quality(quality_mode: str) -> str:
+    """Resolve a quality_mode ("standard"/"precise") to an actual
+    faster-whisper model size. "precise" is always PRECISE_MODEL_SIZE
+    (large-v3-turbo), independent of WHISPER_MODEL_SIZE — see BENCHMARK.md
+    "Bulgu 4"."""
+    if quality_mode == QUALITY_MODE_PRECISE:
+        return PRECISE_MODEL_SIZE
+    return WHISPER_MODEL_SIZE
+
+
+def _get_local_whisper_model(quality_mode: str):
+    """Lazily load (and cache) the local faster-whisper model for the given
+    quality_mode, keyed separately so "standard" and "precise" don't evict
+    each other — but also so a request for one mode never loads the other:
+    only the mode(s) actually requested end up resident in memory at once.
 
     First call downloads the model into the huggingface_hub cache
     (~/.cache/huggingface by default); later calls — including after a
     process restart — reuse that cache and need no network access.
     """
-    global _local_whisper_model
-    if _local_whisper_model is None:
+    if quality_mode not in _local_whisper_models:
         from faster_whisper import WhisperModel  # lazy: see module note above
 
+        model_size = _model_size_for_quality(quality_mode)
         logger.info(
-            "Loading local Whisper model '%s' (cpu, int8) — first run downloads "
-            "it, may take a while...", WHISPER_MODEL_SIZE,
+            "Loading local Whisper model '%s' (quality_mode=%s, cpu, int8) — "
+            "first run downloads it, may take a while...", model_size, quality_mode,
         )
-        _local_whisper_model = WhisperModel(
-            WHISPER_MODEL_SIZE, device="cpu", compute_type="int8",
+        _local_whisper_models[quality_mode] = WhisperModel(
+            model_size, device="cpu", compute_type="int8",
             cpu_threads=_local_cpu_threads(),
         )
-    return _local_whisper_model
+    return _local_whisper_models[quality_mode]
 
 
-def _get_local_whisper_pipeline():
-    """Lazily wrap the faster-whisper model in a BatchedInferencePipeline
-    (cached alongside the model — same lifetime, same underlying weights).
+def _get_local_whisper_pipeline(quality_mode: str):
+    """Lazily wrap the faster-whisper model for this quality_mode in a
+    BatchedInferencePipeline (cached alongside the model — same lifetime,
+    same underlying weights, same per-quality_mode cache key).
 
     Batching groups the VAD-detected speech segments together instead of
     running the encoder/decoder once per segment sequentially — on a ~2min
@@ -374,12 +397,13 @@ def _get_local_whisper_pipeline():
     decode loop doesn't parallelize across cores well, while a batch of
     segments does. See BENCHMARK.md.
     """
-    global _local_whisper_pipeline
-    if _local_whisper_pipeline is None:
+    if quality_mode not in _local_whisper_pipelines:
         from faster_whisper import BatchedInferencePipeline  # lazy: see module note above
 
-        _local_whisper_pipeline = BatchedInferencePipeline(model=_get_local_whisper_model())
-    return _local_whisper_pipeline
+        _local_whisper_pipelines[quality_mode] = BatchedInferencePipeline(
+            model=_get_local_whisper_model(quality_mode)
+        )
+    return _local_whisper_pipelines[quality_mode]
 
 
 def _get_local_diarization_pipeline():
@@ -401,8 +425,11 @@ def _get_local_diarization_pipeline():
     return _local_diarization_pipeline
 
 
-def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str]):
+def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str], quality_mode: str):
     """Run faster-whisper directly on the uploaded bytes.
+
+    quality_mode selects which cached model/pipeline to use — see
+    _get_local_whisper_pipeline/_model_size_for_quality.
 
     Returns (raw_text, whisper_segments) where whisper_segments is a list of
     {"start": float, "end": float, "text": str} — the per-segment timestamps
@@ -410,7 +437,7 @@ def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str]):
     _align_and_format_diarization(). Same role as the API backend's raw_text,
     just with segment timing attached.
     """
-    pipeline = _get_local_whisper_pipeline()
+    pipeline = _get_local_whisper_pipeline(quality_mode)
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
         tmp.write(raw_bytes)
         tmp_path = tmp.name
@@ -557,6 +584,7 @@ async def transcribe_audio(
     request: Request,  # required by @limiter.limit to key on client IP
     file: UploadFile = File(...),
     language: Optional[str] = Form(default="tr"),
+    quality_mode: str = Form(default=QUALITY_MODE_STANDARD),
 ):
     """Transcribe an audio (or video) file using OpenAI Whisper.
 
@@ -576,7 +604,18 @@ async def transcribe_audio(
       and chunked into ≤ 20 MB pieces before being sent to Whisper (per-request
       25 MB limit, WHISPER_LIMIT).
     - `language` is a hint (ISO-639-1) to improve accuracy on low-quality audio.
+    - `quality_mode` ("standard" default, or "precise") only affects local
+      mode (TRANSCRIPTION_BACKEND=local): "standard" uses WHISPER_MODEL_SIZE,
+      "precise" always uses large-v3-turbo (~3x slower, more accurate on some
+      harder/noisier audio — see BENCHMARK.md "Bulgu 4"). Ignored in api mode.
     """
+    if quality_mode not in QUALITY_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Geçersiz quality_mode: {quality_mode!r}. "
+                   f"'{QUALITY_MODE_STANDARD}' veya '{QUALITY_MODE_PRECISE}' olmalı.",
+        )
+
     ext = _get_ext(file.filename or "")
     if ext not in ALLOWED_EXTS:
         # Give a shorter, friendlier list in the error (natively-common formats)
@@ -611,7 +650,7 @@ async def transcribe_audio(
         # No EMERGENT_LLM_KEY, no OpenAI-size-driven chunking (faster-whisper
         # has no 25MB per-request limit — it processes the whole file itself).
         try:
-            raw_text, whisper_segments = _transcribe_local(contents, ext, lang_code)
+            raw_text, whisper_segments = _transcribe_local(contents, ext, lang_code, quality_mode)
         except HTTPException:
             raise
         except Exception as e:

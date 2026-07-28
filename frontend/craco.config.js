@@ -1,6 +1,15 @@
 // craco.config.js
 const path = require("path");
-require("dotenv").config();
+// Skip in test: react-scripts' own env loading (.env.test → .env, without
+// overriding already-set vars) must be authoritative for `craco test` — this
+// unconditional dotenv.config() runs before that and was shadowing
+// frontend/.env.test's fixture values with real frontend/.env values
+// whenever frontend/.env existed, since dotenv never overrides an
+// already-set process.env var. Only ENABLE_HEALTH_CHECK (dev/build-only,
+// see `config` below) needs this outside of test.
+if (process.env.NODE_ENV !== "test") {
+  require("dotenv").config();
+}
 
 // Check if we're in development/preview mode (not production build)
 // Craco sets NODE_ENV=development for start, NODE_ENV=production for build

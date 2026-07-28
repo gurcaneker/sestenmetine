@@ -67,6 +67,7 @@ export default function Transcriber() {
   const [result, setResult] = useState(null); // {text, diarized_text, language, filename, size_bytes}
   const [error, setError] = useState(null);
   const [showDiarized, setShowDiarized] = useState(true);
+  const [qualityMode, setQualityMode] = useState("standard"); // "standard" | "precise"
   const inputRef = useRef(null);
   const [dragOver, setDragOver] = useState(false);
 
@@ -116,6 +117,7 @@ export default function Transcriber() {
     const form = new FormData();
     form.append("file", file);
     form.append("language", "tr");
+    form.append("quality_mode", qualityMode);
 
     try {
       const res = await axios.post(`${API}/transcribe`, form, {
@@ -406,6 +408,44 @@ export default function Transcriber() {
                   <div className="text-sm">
                     <div className="font-semibold text-[#B32218]">Bir hata oluştu</div>
                     <div className="text-gray-700 mt-1 break-words">{error}</div>
+                  </div>
+                </div>
+              )}
+
+              {status === "idle" && (
+                <div className="mt-8" data-testid="quality-mode-panel">
+                  <div className="tech-label mb-2">Mod</div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setQualityMode("standard")}
+                      data-testid="quality-mode-standard-btn"
+                      className={`px-4 py-2 border text-sm font-medium transition-colors ${
+                        qualityMode === "standard"
+                          ? "bg-black text-white border-black"
+                          : "border-black/20 text-gray-700 hover:border-black/50"
+                      }`}
+                    >
+                      Hızlı (standart)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setQualityMode("precise")}
+                      data-testid="quality-mode-precise-btn"
+                      className={`px-4 py-2 border text-sm font-medium transition-colors ${
+                        qualityMode === "precise"
+                          ? "bg-black text-white border-black"
+                          : "border-black/20 text-gray-700 hover:border-black/50"
+                      }`}
+                    >
+                      Hassas (yavaş, gürültülü/zor kayıtlar için)
+                    </button>
+                  </div>
+                  <div className="mt-2 text-xs text-gray-600 max-w-prose">
+                    Hassas mod, düşük kaliteli/gürültülü kayıtlarda bazı durumlarda
+                    daha doğru sonuç verir ama ~3x daha uzun sürer (bkz.{" "}
+                    <span className="font-mono">BENCHMARK.md</span>). Net/temiz
+                    kayıtlarda iki mod da aynı sonucu üretebilir.
                   </div>
                 </div>
               )}

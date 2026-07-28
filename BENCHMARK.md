@@ -2,11 +2,11 @@
 
 Bu doküman, `TRANSCRIPTION_BACKEND=local` (`backend/server.py` →
 `_transcribe_local`) için yapılan performans optimizasyonunun ve
-tiny/base/small model karşılaştırmasının ölçüm sonuçlarını kaydeder. Amaç:
-gerçek veriyle karar vermek, tahminle değil — `WHISPER_MODEL_SIZE` ve
-`WHISPER_BATCH_SIZE` seçimi bu ölçümlere dayanıyor ama env değişkeni olarak
-kalıyor (kod içinde sabitlenmedi), böylece kendi ses verinizle farklı
-sonuç alırsanız `.env`'den değiştirebilirsiniz.
+tiny/base/small/large-v3-turbo model karşılaştırmasının ölçüm sonuçlarını
+kaydeder. Amaç: gerçek veriyle karar vermek, tahminle değil —
+`WHISPER_MODEL_SIZE` ve `WHISPER_BATCH_SIZE` seçimi bu ölçümlere dayanıyor
+ama env değişkeni olarak kalıyor (kod içinde sabitlenmedi), böylece kendi ses
+verinizle farklı sonuç alırsanız `.env`'den değiştirebilirsiniz.
 
 ## Ortam
 
@@ -126,6 +126,121 @@ somut, güvenle söylenebilecek sonuç: **hız farkı büyük** (tiny, small'dan
 hafif bir avantaj gösteriyor, ama **kelime doğruluğu** bu test setinde
 ayırt edici değildi.
 
+## Bulgu 4 — large-v3-turbo (2026-07-28)
+
+faster-whisper 1.2.1'in tanıdığı model listesi (`faster_whisper.available_models()`)
+`large-v3-turbo`'yu içeriyor — `WHISPER_MODEL_SIZE=large-v3-turbo` **kod
+değişikliği gerektirmeden** çalışıyor (`WHISPER_MODEL_SIZE` zaten serbest
+metin, bir whitelist'e karşı doğrulanmıyor); gerçek sunucu üzerinden
+(`TRANSCRIPTION_BACKEND=local`, `WHISPER_MODEL_SIZE=large-v3-turbo`) canlı bir
+`/api/transcribe` isteğiyle de doğrulandı. İlk kullanımda modeli indiriyor
+(~1.6 GB, `~/.cache/huggingface`'e).
+
+### Hız (batching aktif, `cpu_threads=4`, `batch_size=8`)
+
+| Kayıt | small | large-v3-turbo | Yavaşlama |
+|---|---|---|---|
+| `jfk.flac` (~11s, İngilizce, tek segment) | 2.15s | 7.79s | **3.6x** |
+| ~115s sentetik, çok-segmentli (İngilizce) | 11.08s | 36.72s | **3.3x** |
+| Türkçe örnek (~20s, bkz. aşağıda) | 3.76s | 9.76s | **2.6x** |
+
+`large-v3-turbo`, `small`'dan tutarlı şekilde ~3x daha yavaş — beklenen bir
+sonuç (çok daha büyük bir model, hâlâ CPU'da int8 ile). 4 çekirdekli VPS'te
+gerçek zamanlı kullanım için hâlâ yeterince hızlı (~20s'lik bir kayıt için
+~10s işlem süresi, yani gerçek zamandan ~2x hızlı) ama `small`'a göre gözle
+görülür bir gecikme farkı var.
+
+### Doğruluk — İngilizce (`jfk.flac`, "ask not what your country...")
+
+Önceki bulguyla (Bulgu 3) aynı: bu temiz kayıtta **kelime düzeyinde fark yok**,
+`large-v3-turbo` da `tiny`/`small` ile birebir aynı, doğru transkripti
+üretti. Bu temiz test setinde büyük model bir avantaj göstermedi.
+
+### Doğruluk — Türkçe (yeni test verisi)
+
+Projenin gerçek hedef dili Türkçe olduğu ve `test_fixtures/`'ta gerçek bir
+Türkçe kayıt bulunmadığı için, gTTS ile (bu ölçüm için geçici olarak kurulup
+sonra kaldırıldı — projeye bağımlılık olarak eklenmedi) gerçek bir Türkçe
+sesli kayıt sentezlendi (~20s, Türkçe'ye özgü karakterler — İstanbul, üçte,
+çeyreklik, güneşli — içeren 3 cümle):
+
+> Kaynak metin: "Merhaba, bugün İstanbul'da hava oldukça güzel ve güneşli.
+> Yarın öğleden sonra saat üçte toplantımız var, lütfen zamanında gelin.
+> Şirketimizin çeyreklik büyüme oranı yüzde on ikiye yükseldi, bu gerçekten
+> önemli bir başarı."
+
+| Model | Transkript |
+|---|---|
+| small | "Merhaba. Bugün İstanbul'da hava oldukça güzel ve güneşli. Yarın öğleden sonra saat **üçte** toplantımız var. Lütfen zamanında gelin. Şirketimizin çeyreklik büyüme oranı **yüzde on ikiye** yükseldi. Bu gerçekten önemli bir başarı." |
+| large-v3-turbo | "Merhaba, bugün İstanbul'da hava oldukça güzel ve güneşli. Yarın öğleden sonra saat **3'te** toplantımız var. Lütfen zamanında gelin. Şirketimizin çeyreklik büyüme oranı **%12'ye** yükseldi. Bu gerçekten önemli bir başarı." |
+
+**Kelime/anlam hatası yok — ikisi de kaynak metni doğru anladı.** Tek somut
+fark: `large-v3-turbo` sayıları rakama normalize ediyor ("saat üçte" →
+"saat 3'te", "yüzde on ikiye" → "%12'ye"), `small` konuşmadaki gibi yazıyla
+bırakıyor. Hangisi "daha doğru" tamamen kullanım amacına bağlı (yazılı rapor
+için rakam biçimi daha okunaklı olabilir; birebir konuşma dökümü için yazıyla
+biçim daha sadık). Noktalama da hafif farklı (`large-v3-turbo` kaynaktaki ilk
+virgülü koruyor, `small` noktaya çeviriyor) — anlamı etkilemiyor.
+
+Bu, gTTS'in net/stüdyo-kalitesi TTS çıktısı olduğu, projenin asıl hedefi olan
+gürültülü/düşük kaliteli gerçek kayıtları temsil etmediği unutulmamalı — bu
+yüzden Türkçe için de "gürültülü/düşük kaliteli kayıtta model farkı" sorusu
+hâlâ açık (bkz. Bulgu 3 "Değerlendirme").
+
+### Doğruluk — daha zor/belirsiz bir İngilizce klip (`jfk.wav`, "she had your dark suit...")
+
+Bu proje setindeki `test_fixtures/jfk.wav` (2.9s), "ask not..." alıntısından
+FARKLI ve fonetik olarak daha belirsiz bir klasik konuşma-tanıma test
+cümlesi ("she had your dark suit in greasy wash water all year" — doğru
+metin). Burada, Bulgu 3'ün aksine, **model boyutu gerçekten fark yarattı**:
+
+| Model | Transkript | Hata |
+|---|---|---|
+| tiny | "She had your dark suit in greasy wash **for** all year." | "water" → "for" |
+| small | "She had **a duck** suit **and** greasy wash **for** all year." | "your dark" → "a duck", "in" → "and", "water" → "for" (3 hata — **tiny'den daha kötü**) |
+| large-v3-turbo | "She had your dark suit **and** greasy wash water all year." | sadece "in" → "and" (1 hata, ama "water" doğru) |
+
+**Bu tek örnekte `large-v3-turbo` en az hatalı, `small` ise `tiny`'den daha
+kötü** — yani model boyutu ile doğruluk arasındaki ilişki monoton değil;
+Bulgu 3'teki "temiz sesle model boyutu fark etmiyor" sonucu, kolay/net bir
+kayıtla sınırlıydı. Daha belirsiz/fonetik olarak zor sesle gerçek bir fark
+ortaya çıkabiliyor — ama tek bir 2.9s klip, genellemek için yeterli değil,
+sadece "model boyutu her zaman farksızdır" iddiasını çürüten somut bir
+karşı-örnek.
+
+### Değerlendirme
+
+`large-v3-turbo` ~3x daha yavaş ama bazı durumlarda (zor/belirsiz ses) daha
+doğru olabiliyor; net/kolay seslerde fark yok. `WHISPER_MODEL_SIZE`
+**değiştirilmedi** — env değişkeni olarak `small` varsayılanında kalıyor.
+Gürültülü/düşük kaliteli gerçek kullanım senaryonuz hız toleranslıysa
+(offline/toplu işleme gibi) `large-v3-turbo`'yu `.env`'de deneyip kendi
+verinizle karşılaştırmanız önerilir.
+
+Bu bulgu üzerine, `.env` genelinde sabit bir seçim yapmak yerine, **her
+istekte** hız/doğruluk seçimi yapılabilmesi için `/api/transcribe`'a
+`quality_mode` form alanı eklendi (`"standard"` → `WHISPER_MODEL_SIZE`,
+`"precise"` → her zaman bu `large-v3-turbo` — bkz. README.md ve CLAUDE.md).
+Yukarıdaki tüm ölçümler bu iki modun altyapısını doğrudan doğruluyor.
+
+## Bulgu 5 — quality_mode: iki model aynı anda yüklenmeden per-istek seçim (2026-07-28)
+
+`_get_local_whisper_model`/`_get_local_whisper_pipeline` artık `quality_mode`
+anahtarlı bir dict'te (`_local_whisper_models`/`_local_whisper_pipelines`)
+cache'leniyor — bir model sadece o `quality_mode` fiilen istendiğinde
+yüklenir. Doğrulandı (mock'lu, gerçek model indirmeden — `test_local_mode.py`
+`TestQualityMode`):
+
+- Sadece `"standard"` istenirse `"precise"` (large-v3-turbo) hiç yüklenmez —
+  gereksiz RAM kullanımı yok.
+- Aynı `quality_mode`'a art arda gelen istekler cache'i kullanır — ikinci
+  çağrıda `WhisperModel()` tekrar konstrüktle çağrılmaz.
+- İki farklı `quality_mode` istenirse (bir sunucu ömrü boyunca hem standard
+  hem precise talep edilirse) ikisi de ayrı ayrı cache'te kalır — bu durumda
+  gerçekten iki model belleğe yüklenmiş olur (görev tanımının izin verdiği
+  davranış: "gereksiz" olan aynı anda İKİSİNİ DE önceden yüklemek, talep
+  edilmemiş bir modeli önceden yüklemek değil).
+
 ## Yapılan kod değişiklikleri
 
 - `backend/server.py`: `_get_local_whisper_pipeline()` eklendi
@@ -143,16 +258,24 @@ ayırt edici değildi.
   `test_local_cpu_threads_uses_sched_affinity_not_cpu_count` regresyon testi
   eklendi. Tam paket: 21 passed, 4 skipped, 0 hata (bkz. `memory/PRD.md`
   changelog).
+- **large-v3-turbo desteği için kod değişikliği GEREKMEDİ:** faster-whisper
+  1.2.1 `available_models()` listesinde zaten var, `WHISPER_MODEL_SIZE`
+  serbest metin (bir whitelist'e karşı doğrulanmıyor) — `.env`'de
+  `WHISPER_MODEL_SIZE=large-v3-turbo` yazmak yeterli, gerçek sunucu üzerinden
+  doğrulandı (bkz. Bulgu 4).
 
 ## Ölçüm scripti (tekrarlanabilirlik için)
 
 ```python
 # .venv/bin/python bench_whisper.py {nonbatched|batched} <model_size> <cpu_threads> [batch_size]
 # taskset -c 0-3 ile çalıştırılarak 4 çekirdekli VPS simüle edildi.
+# BENCH_AUDIO / BENCH_LANGUAGE env değişkenleriyle farklı dosya/dil test edilebilir
+# (örn. BENCH_LANGUAGE=tr Türkçe bir örnekle karşılaştırma için).
 import os, resource, time, sys, json
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 AUDIO = os.environ.get("BENCH_AUDIO", "test_fixtures/jfk.flac")
+LANGUAGE = os.environ.get("BENCH_LANGUAGE", "en")
 
 def cpu_time():
     r = resource.getrusage(resource.RUSAGE_SELF)
@@ -172,12 +295,12 @@ if mode == "nonbatched":
     model_size, cpu_threads = sys.argv[2], int(sys.argv[3])
     model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads)
     run(f"nonbatched/{model_size}", lambda: " ".join(
-        s.text.strip() for s in model.transcribe(AUDIO, language="en", vad_filter=True)[0]))
+        s.text.strip() for s in model.transcribe(AUDIO, language=LANGUAGE, vad_filter=True)[0]))
 else:
     model_size, cpu_threads, batch_size = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
     model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=cpu_threads)
     pipeline = BatchedInferencePipeline(model=model)
     run(f"batched/{model_size}/batch_size={batch_size}", lambda: " ".join(
         s.text.strip() for s in pipeline.transcribe(
-            AUDIO, language="en", vad_filter=True, batch_size=batch_size)[0]))
+            AUDIO, language=LANGUAGE, vad_filter=True, batch_size=batch_size)[0]))
 ```

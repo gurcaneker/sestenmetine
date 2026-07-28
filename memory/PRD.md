@@ -338,3 +338,74 @@ Sıralama: security → cleanup → consistency → test → infra → docs (CLA
   ihtiyaç). Docker image'ında ffmpeg zaten kurulu (infra-agent doğrulaması) —
   gerçek bir `.dav`/`.ogg` dosyasıyla tam pipeline'ın orada test edilmesi
   öneriliyor.
+
+**2026-07-28 — large-v3-turbo benchmark'a eklendi**
+- faster-whisper 1.2.1'in `available_models()` listesi `large-v3-turbo`'yu
+  zaten içeriyor; `WHISPER_MODEL_SIZE` serbest metin olduğu (bir whitelist'e
+  karşı doğrulanmadığı) için **kod değişikliği gerekmedi** — `.env`'de
+  `WHISPER_MODEL_SIZE=large-v3-turbo` yazmak yeterli. Gerçek sunucu üzerinden
+  (`TRANSCRIPTION_BACKEND=local`) canlı bir `/api/transcribe` isteğiyle
+  doğrulandı (ilk kullanımda ~1.6 GB model indiriyor).
+- Benchmark script'i (`BENCHMARK.md`'deki, artık `BENCH_LANGUAGE` env
+  değişkenini de destekliyor) `large-v3-turbo`'yu içerecek şekilde
+  genişletildi. Hız: `small`'a göre tutarlı şekilde ~3x daha yavaş (3
+  farklı kayıtta ölçüldü: 2.6x-3.6x arası).
+- Doğruluk — İngilizce, temiz kayıt (`jfk.flac`): önceki bulguyla aynı,
+  kelime düzeyinde fark yok.
+- Doğruluk — Türkçe (yeni test verisi): gTTS ile (bu ölçüm için geçici
+  olarak kurulup hemen sonra kaldırıldı, projeye bağımlılık olarak
+  eklenmedi) gerçek bir ~20s Türkçe kayıt sentezlendi (Türkçe'ye özgü
+  karakterler/kelimeler içeren 3 cümle). Hem `small` hem `large-v3-turbo`
+  kelime/anlam hatası yapmadı — tek somut fark `large-v3-turbo`'nun sayıları
+  rakama normalize etmesi ("saat üçte"→"saat 3'te", "yüzde on ikiye"→"%12'ye"),
+  `small` ise konuşmadaki gibi yazıyla bırakıyor. gTTS stüdyo-kalitesinde
+  olduğu için gürültülü/düşük kaliteli gerçek Türkçe kayıtla doğrulama hâlâ
+  açık (bkz. önceki changelog girdisinin "Değerlendirme" notu, aynı kısıt
+  geçerli).
+- Doğruluk — daha zor/belirsiz bir İngilizce klip (`jfk.wav`, "she had your
+  dark suit in greasy wash water all year"): burada **model boyutu gerçekten
+  fark yarattı ve monoton değildi** — `tiny` 1 hata, `small` 3 hata (`tiny`'den
+  DAHA KÖTÜ), `large-v3-turbo` 1 hata (en az). Önceki benchmark turunun
+  "temiz sesle model boyutu fark etmiyor" sonucunun sadece kolay/net bir
+  kayıtla sınırlı olduğunu gösteren somut bir karşı-örnek — tek bir 2.9s
+  klip, genellemek için yeterli değil ama not edilmeye değer.
+- `WHISPER_MODEL_SIZE` **değiştirilmedi** — env değişkeni olarak kalıyor,
+  varsayılan hâlâ `small`. Tam metodoloji, tablolar, kaynak metin ve
+  script güncellemesi: `BENCHMARK.md` "Bulgu 4".
+
+**2026-07-28 — per-istek quality_mode (hız/doğruluk seçimi)**
+- Önceki benchmark turunun bulgusu üzerine (large-v3-turbo bazı zor/gürültülü
+  kayıtlarda daha doğru ama ~3x yavaş), kullanıcının `.env`'de sabit bir
+  seçim yapmak yerine **her istekte** hız/doğruluk arasında seçim
+  yapabilmesi sağlandı: `/api/transcribe`'a yeni bir opsiyonel form alanı,
+  `quality_mode` (`"standard"` varsayılan, veya `"precise"`). Local mode'da
+  `"standard"` → `WHISPER_MODEL_SIZE` (env), `"precise"` → her zaman
+  `large-v3-turbo` (env'den bağımsız, sabit — `PRECISE_MODEL_SIZE`). Geçersiz
+  bir `quality_mode` değeri net bir 400 ile reddediliyor. api mode bu alanı
+  yok sayıyor (sadece local mode'u etkiliyor, görev tanımı gereği).
+- Model/pipeline cache'i `quality_mode` anahtarlı bir dict'e taşındı
+  (`_local_whisper_models`, `_local_whisper_pipelines` — önceden tek bir
+  modül-seviyesi global değişkendi). `_get_local_whisper_model(quality_mode)`
+  sadece o `quality_mode` fiilen istendiğinde model yükler ve cache'ler;
+  `_model_size_for_quality()` `quality_mode`'u gerçek model boyutu string'ine
+  çeviriyor. Bu, iki modelin GEREKSİZ yere aynı anda belleğe yüklenmesini
+  önlüyor (istenmeyen mod hiç yüklenmez) ama aynı moddaki art arda gelen
+  istekler için cache/yeniden-kullanım sağlıyor (görev gereksinimi tam
+  olarak buydu).
+- Frontend (`Transcriber.jsx`): `qualityMode` state'i (varsayılan
+  `"standard"`), form'a `quality_mode` alanı eklendi, dosya seçili panelinde
+  iki buton — "Hızlı (standart)" (varsayılan seçili) ve "Hassas (yavaş,
+  gürültülü/zor kayıtlar için)" — ve BENCHMARK.md Bulgu 4'ü özetleyen kısa
+  bir açıklama metni eklendi.
+- Test: `test_local_mode.py`'ye yeni `TestQualityMode` sınıfı — mock'lu
+  (gerçek model indirmeden): `_model_size_for_quality` çözümlemesi
+  (`"standard"`→env, `"precise"`→her zaman `large-v3-turbo`, env'i override
+  ettiği dahil), cache'in `quality_mode` başına ayrı tutulduğu, bir modun
+  diğerini asla tetiklemediği (RAM gereksinimi), aynı moddaki tekrar
+  isteklerin cache'i kullandığı (yeniden yükleme yok), `TestClient` ile
+  gerçek endpoint üzerinden `quality_mode`'un `_transcribe_local`'a doğru
+  forward edildiği (hem "precise" hem varsayılan "standard" için) ve
+  geçersiz bir `quality_mode`'un 400 ile reddedildiği. Tam paket (kod
+  değişikliği olduğu için backend_test.py + test_local_mode.py +
+  test_media_validation.py hepsi çalıştırıldı).
+- Detay ve tam gerekçe: `BENCHMARK.md` "Bulgu 5".

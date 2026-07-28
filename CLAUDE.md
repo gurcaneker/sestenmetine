@@ -102,6 +102,15 @@ edilemez bulundu; kod silinmedi, `transcribe_audio()` içinde çağrı yorum
 satırına alındı (bkz. kod yorumu ve README.md "Local mode ile çalıştırma"
 — yeniden açma talimatı orada). API mode bundan etkilenmez.
 
+`/api/transcribe`'ın `quality_mode` form alanı (`"standard"` varsayılan,
+veya `"precise"`) sadece local mode'u etkiler: `"standard"` → `WHISPER_MODEL_SIZE`,
+`"precise"` → her zaman `large-v3-turbo` (env'den bağımsız, sabit). Her iki
+model de ayrı ayrı, sadece talep edildiklerinde belleğe yüklenip cache'lenir
+(`_local_whisper_models`/`_local_whisper_pipelines`, `quality_mode` anahtarlı
+dict) — bir mod hiç istenmediyse hiç yüklenmez, aynı modda art arda gelen
+istekler yeniden yükleme maliyeti ödemez. Detay ve doğruluk/hız karşılaştırması:
+`BENCHMARK.md` "Bulgu 4".
+
 ## Bilinen Kritik Sorunlar
 
 Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncellendi:
@@ -229,6 +238,35 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
   bir `.dav` örneği bulunamadı/pratik değildi — o senaryo bozuk/sahte byte'larla
   test edildi, bkz. dosyanın modül docstring'i). Tam paket: 28 test geçti,
   4 skip, 0 hata.
+- **large-v3-turbo benchmark'a eklendi (2026-07-28, kod değişikliği yok):**
+  faster-whisper 1.2.1 `large-v3-turbo`'yu zaten tanıyor, `WHISPER_MODEL_SIZE`
+  serbest metin olduğu için `.env`'de `WHISPER_MODEL_SIZE=large-v3-turbo`
+  yazmak yeterli — gerçek sunucu üzerinden doğrulandı. `small`'a göre
+  tutarlı şekilde ~3x daha yavaş; net/kolay bir kayıtta (`jfk.flac`, "ask
+  not...") kelime doğruluğu farkı yok, ama daha zor/belirsiz bir klipte
+  (`jfk.wav`, "she had your dark suit...") **`small`, `tiny`'den daha fazla
+  hata yaptı, `large-v3-turbo` ise en az hatalıydı** — model boyutu/doğruluk
+  ilişkisinin monoton olmadığına dair somut bir örnek. Ayrıca gerçek bir
+  Türkçe örnekle (gTTS ile bu ölçüm için üretildi, projeye bağımlılık olarak
+  eklenmedi) test edildi: kelime/anlam hatası yok, tek fark `large-v3-turbo`'nun
+  sayıları rakama normalize etmesi ("saat üçte"→"saat 3'te"). `WHISPER_MODEL_SIZE`
+  **değiştirilmedi** — env değişkeni, varsayılan hâlâ `small`. Tam detay:
+  `BENCHMARK.md` Bulgu 4.
+- **Per-istek quality_mode seçimi eklendi (2026-07-28):** `/api/transcribe`'a
+  yeni bir opsiyonel form alanı — `quality_mode` (`"standard"` varsayılan,
+  `"precise"`). Local mode'da `"standard"` → `WHISPER_MODEL_SIZE`, `"precise"`
+  → her zaman `large-v3-turbo` (env'den bağımsız). Geçersiz bir değer net bir
+  400 ile reddediliyor. Model/pipeline cache'i `quality_mode` anahtarlı bir
+  dict'e taşındı (`_local_whisper_models`/`_local_whisper_pipelines`) — iki
+  model de aynı anda belleğe yüklenmiyor, sadece fiilen talep edilen mod
+  yükleniyor, aynı moddaki art arda istekler cache'i kullanıyor. Frontend'e
+  "Hızlı (standart)" / "Hassas (yavaş, gürültülü/zor kayıtlar için)" iki
+  buton eklendi (varsayılan Hızlı), BENCHMARK.md Bulgu 4'ü özetleyen kısa bir
+  açıklama metniyle. api mode bu alandan etkilenmiyor (yok sayılıyor).
+  Test: `test_local_mode.py`'ye yeni bir `TestQualityMode` sınıfı — model
+  boyutu çözümlemesi, cache'in mod başına ayrı tutulduğu, bir modun
+  diğerini asla yüklemediği, endpoint'in `quality_mode`'u doğru forward
+  ettiği ve geçersiz değeri reddettiği, hepsi mock'lu (gerçek model indirmeden).
 
 ## Sabit Kurallar (Claude Code her zaman uymalı)
 
