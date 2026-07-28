@@ -209,6 +209,29 @@ jest-dom matcher'larını yükler).
 | GET | `/api/health` | — | Sağlık kontrolü |
 | POST | `/api/transcribe` | `X-API-Key` + rate limit (5/dk) | Dosya yükle → transkribe et (+ opsiyonel diarization) |
 
+## Desteklenen Dosya Formatları
+
+Tam liste `backend/server.py`'de (`WHISPER_NATIVE_EXTS`/`EXTRA_AUDIO_EXTS`/
+`VIDEO_EXTS`/`DVR_EXTS`) — özet:
+
+- **Ses:** mp3, wav, m4a, aac, ogg, opus, wma, aiff, amr, ac3, au, caf, mp2 …
+- **Video (ses otomatik ayıklanır):** mp4, mov, avi, mkv, webm, wmv, flv,
+  3gp, ts, mpg …
+- **DVR/güvenlik kamerası:** `.dav` (Dahua ve benzeri DVR'lar) — **best-effort,
+  garanti değil.** Bu format genelde H.264 video + G.711/G.726 ses codec'i
+  içeriyor, ffmpeg/libav çoğunlukla decode edebiliyor ama garantili değil;
+  codec desteklenmiyorsa net bir 400 hatası alırsınız ("VLC ile standart bir
+  formata dönüştürün").
+- **Desteklenmeyen:** `.flac` — bilinçli olarak dışarıda (bkz. `memory/PRD.md`
+  backlog, CLAUDE.md "Bilinen Kritik Sorunlar" madde 4).
+
+Uzantı tek başına yeterli değil: her yükleme, transkripsiyona geçmeden önce
+`_verify_media_stream()` ile gerçekten decode edilebilir bir ses akışı içerip
+içermediği açısından da kontrol ediliyor (PyAV/libav ile — sistemde ayrıca
+`ffprobe` binary'si gerekmiyor). Uzantı doğru ama içerik bozuk/decode
+edilemezse (özellikle `.dav`'de olası), jenerik "desteklenmiyor" yerine
+içeriğe özel bir 400 hatası dönülür.
+
 ## Daha Fazla Bilgi
 
 - [`CLAUDE.md`](CLAUDE.md) — proje durumu, mimari, bilinen açık sorunlar,

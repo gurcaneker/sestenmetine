@@ -237,6 +237,8 @@ class TestLocalModeDiarizationDisabled:
 
         fake_whisper_segments = [{"start": 0.0, "end": 1.0, "text": "Merhaba"}]
         with patch.object(
+            server, "_verify_media_stream"  # content validation: see test_media_validation.py
+        ), patch.object(
             server, "_transcribe_local", return_value=("Merhaba", fake_whisper_segments)
         ) as mock_transcribe, patch.object(
             server, "_diarize_local"

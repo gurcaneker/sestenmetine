@@ -103,13 +103,17 @@ CHUNK_TARGET_BYTES = 20 * 1024 * 1024              # keep each chunk safely unde
 WHISPER_NATIVE_EXTS = {"mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"}
 
 # Additional audio containers we accept — ffmpeg/pydub decodes then we transcode to MP3
-# NOTE: flac/ogg intentionally excluded — see memory/PRD.md backlog. The
-# transcode path was verified to work correctly with a working ffmpeg/ffprobe
-# on PATH, but production returned a raw 500 provider error, most likely
-# because ffmpeg/ffprobe wasn't available in that environment. Re-enable only
-# after infra-agent confirms ffmpeg/ffprobe are present in the deploy image.
+# NOTE: flac intentionally still excluded — see memory/PRD.md backlog (P2,
+# server-side transcoding kept off, no decision to reverse it here).
+# .ogg WAS excluded for the same reason (raw 500 in production, most likely
+# ffmpeg/ffprobe not confirmed present) but is re-enabled here now that (a)
+# infra-agent's Docker build already verified ffmpeg is present in the deploy
+# image, and (b) _verify_media_stream() below independently probes real
+# stream content before transcoding — the two things blocking re-enablement
+# are both addressed. flac stays out; that's a separate, deliberate call, not
+# revisited by this change. See CLAUDE.md "Bilinen Kritik Sorunlar".
 EXTRA_AUDIO_EXTS = {
-    "oga", "opus", "aac", "wma",
+    "ogg", "oga", "opus", "aac", "wma",
     "aiff", "aif", "aifc", "amr", "ac3", "au", "caf",
     "3ga", "voc", "ra", "mka", "dts", "wv", "mp2",
 }
@@ -121,7 +125,16 @@ VIDEO_EXTS = {
     "ts", "asf", "rm", "rmvb", "f4v", "divx", "xvid",
 }
 
-ALLOWED_EXTS = WHISPER_NATIVE_EXTS | EXTRA_AUDIO_EXTS | VIDEO_EXTS
+# DVR/security-camera recording containers — vendor-specific (Dahua and
+# similar NVR/DVR systems use .dav), typically H.264 video + G.711/G.726
+# audio wrapped in a non-standard container. ffmpeg/libav CAN decode most of
+# these but it's genuinely best-effort, not guaranteed (unlike the other
+# sets above, which are all standard containers) — hence _verify_media_stream
+# gives .dav uploads a distinct, actionable error message on failure instead
+# of the generic one. See CLAUDE.md "Bilinen Kritik Sorunlar".
+DVR_EXTS = {"dav"}
+
+ALLOWED_EXTS = WHISPER_NATIVE_EXTS | EXTRA_AUDIO_EXTS | VIDEO_EXTS | DVR_EXTS
 
 # Whisper (whisper-1) supports natively: mp3, mp4, mpeg, mpga, m4a, wav, webm.
 # Everything else is decoded via ffmpeg/pydub and re-encoded to MP3 before Whisper.
@@ -134,6 +147,62 @@ def _get_ext(filename: str) -> str:
     if not filename or '.' not in filename:
         return ''
     return filename.rsplit('.', 1)[-1].lower()
+
+
+def _verify_media_stream(raw_bytes: bytes, ext: str) -> None:
+    """Confirm the upload actually contains a decodable audio stream — not
+    just a plausible file extension.
+
+    A correct extension doesn't guarantee decodable content, especially for
+    non-standard containers (.dav DVR/security-camera recordings above all):
+    the codec inside can be unsupported even though the container "looks"
+    right. Catching that here gives a clear 400 instead of a confusing crash
+    later in _prepare_chunks (pydub/ffmpeg) or _transcribe_local
+    (faster-whisper).
+
+    Uses PyAV (`av`) rather than shelling out to the `ffprobe` CLI: PyAV
+    bundles its own statically-linked libav — the same decoding machinery
+    ffprobe is built on — so this works without requiring a system
+    ffmpeg/ffprobe binary on PATH (see _decode_waveform_for_pyannote's
+    docstring for the same rationale elsewhere in this file). `av` is a
+    transitive dependency of faster-whisper, so it's optional the same way
+    faster-whisper/pyannote.audio are: if it's not installed, this degrades
+    to the previous extension-only check rather than hard-failing "api" mode.
+    """
+    try:
+        import av  # lazy: see local-mode module note above
+    except ImportError:
+        logger.warning(
+            "PyAV not installed — skipping media stream content validation "
+            "(falling back to extension-only check) for .%s upload.", ext,
+        )
+        return
+
+    try:
+        container = av.open(io.BytesIO(raw_bytes))
+        try:
+            has_audio = len(container.streams.audio) > 0
+        finally:
+            container.close()
+    except Exception as e:
+        logger.warning("Media stream probe failed for .%s upload: %s", ext, e)
+        has_audio = False
+
+    if has_audio:
+        return
+
+    if ext in DVR_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail="Bu DVR kaydı işlenemedi, codec desteklenmiyor olabilir — "
+                   "VLC ile standart bir formata (mp4/mp3) dönüştürüp tekrar "
+                   "deneyin.",
+        )
+    raise HTTPException(
+        status_code=400,
+        detail=f"Dosyada işlenebilir bir ses akışı bulunamadı (.{ext}). "
+               f"Dosya bozuk olabilir veya bu codec desteklenmiyor olabilir.",
+    )
 
 
 def _prepare_chunks(raw_bytes: bytes, ext: str) -> List[bytes]:
@@ -494,11 +563,14 @@ async def transcribe_audio(
     Requires a valid `X-API-Key` header (see require_api_key) and is rate
     limited to RATE_LIMIT per client IP (see SECURITY_NOTES.md).
 
-    - Accepts most audio and video formats (mp3, wav, m4a, webm, opus,
-      aac, wma, aiff, amr, mov, avi, mkv, mp4, wmv, flv, 3gp, mkv, mpg, …).
-      Non-native formats are transparently decoded/transcoded with ffmpeg; for
-      video inputs, only the audio track is used. flac/ogg are NOT currently
-      accepted (see EXTRA_AUDIO_EXTS comment above).
+    - Accepts most audio and video formats (mp3, wav, m4a, webm, opus, ogg,
+      aac, wma, aiff, amr, mov, avi, mkv, mp4, wmv, flv, 3gp, mkv, mpg, …) plus
+      DVR/security-camera recordings (.dav — best-effort, see DVR_EXTS
+      comment). Non-native formats are transparently decoded/transcoded with
+      ffmpeg; for video inputs, only the audio track is used. flac is NOT
+      currently accepted (see EXTRA_AUDIO_EXTS comment above). Every upload's
+      actual content (not just its extension) is probed for a real audio
+      stream — see _verify_media_stream.
     - Server accepts up to MAX_UPLOAD_SIZE (currently 500 MB); files that
       don't natively fit Whisper are transcoded (mono / 16 kHz / MP3 64 kbps)
       and chunked into ≤ 20 MB pieces before being sent to Whisper (per-request
@@ -525,6 +597,10 @@ async def transcribe_audio(
             detail=f"Dosya çok büyük ({size / (1024*1024):.1f} MB). "
                    f"Maksimum {MAX_UPLOAD_SIZE // (1024*1024)} MB.",
         )
+
+    # Extension alone doesn't guarantee decodable content — see
+    # _verify_media_stream docstring (.dav DVR recordings especially).
+    _verify_media_stream(contents, ext)
 
     lang_code = None
     if language and 2 <= len(language) <= 5:

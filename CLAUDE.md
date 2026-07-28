@@ -26,7 +26,7 @@ sestenmetine/
 │   ├── Dockerfile        Python 3.11-slim + ffmpeg, --workers 1 (bkz. SECURITY_NOTES.md)
 │   ├── .env.example
 │   ├── pytest.ini
-│   └── tests/backend_test.py, tests/test_local_mode.py
+│   └── tests/backend_test.py, tests/test_local_mode.py, tests/test_media_validation.py
 ├── frontend/              React 19 (CRA + craco)
 │   ├── src/pages/Transcriber.jsx        Uygulamanın tüm mantığı (TEK BİLEŞEN)
 │   ├── src/pages/Transcriber.test.jsx   Jest + React Testing Library
@@ -83,11 +83,13 @@ sestenmetine/
 `/transcribe`, `X-API-Key` header gerektirir (401 eşleşmezse) ve IP başına
 5/dakika ile sınırlıdır (429 aşılırsa); `/` ve `/health` korumasız kalır.
 
-İş akışı (`TRANSCRIPTION_BACKEND=api`, varsayılan): `_prepare_chunks()` →
-mono/16kHz downsample, ≤20MB parçalara böl → `transcribe_audio()` →
-format/boyut doğrula, transcode/chunk, Whisper'a gönder, birleştir →
-`_diarize_with_claude()` → Whisper çıktısını claude-sonnet-4-6'ya gönderip
-konuşmacı ayrımı yaptır (hata durumunda sessizce None dönüyor).
+İş akışı (`TRANSCRIPTION_BACKEND=api`, varsayılan): `transcribe_audio()` →
+format/boyut doğrula → `_verify_media_stream()` (uzantıdan bağımsız, gerçek
+içerik kontrolü — hem api hem local mode'da çalışır, bkz. aşağıdaki "Format
+genişletme" notu) → `_prepare_chunks()` (mono/16kHz downsample, ≤20MB
+parçalara böl) → Whisper'a gönder, birleştir → `_diarize_with_claude()` →
+Whisper çıktısını claude-sonnet-4-6'ya gönderip konuşmacı ayrımı yaptır (hata
+durumunda sessizce None dönüyor).
 
 İş akışı (`TRANSCRIPTION_BACKEND=local`): aynı format/boyut doğrulaması →
 `_transcribe_local()` (faster-whisper `BatchedInferencePipeline`,
@@ -111,12 +113,16 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
    + eksik değişkeni adıyla belirten net `RuntimeError`.
 3. ✅ **Çözüldü — dosya boyutu limiti tutarsızlığı** (consistency-agent): tek
    kaynak `MAX_UPLOAD_SIZE` (500MB), frontend/backend/PRD senkron.
-4. ⚠️ **Kısmen çözüldü — FLAC/OGG:** Artık tutarlı davranıyor (500 yerine net
-   400 "desteklenmiyor" hatası — consistency-agent, Seçenek A). **Hâlâ açık:**
-   gerçek destek (Seçenek B, server-side transcoding) kod olarak hazır ve
-   lokal test edilmiş ama **P2 backlog'ta kapalı duruyor** — infra-agent'ın
-   deploy image'ında ffmpeg/ffprobe'un gerçekten kurulu olduğunu doğrulaması
-   bekleniyor (bkz. `memory/PRD.md` backlog notu).
+4. ✅ **OGG çözüldü, FLAC bilinçli olarak hâlâ kapalı (2026-07-28):** Bu madde
+   önceden "FLAC/OGG ikisi de kapalı" idi (consistency-agent, Seçenek A —
+   net 400, 500 yerine). Artık **.ogg `ALLOWED_EXTS`'te** — infra-agent'ın
+   Docker build'inde ffmpeg'in kurulu olduğunu doğrulaması VE yeni
+   `_verify_media_stream()` (ffprobe/PyAV ile gerçek stream içeriği kontrolü,
+   bkz. aşağıdaki "Format genişletme" notu) bu maddeyi eskiden bloke eden iki
+   şeyi de kapattı. **FLAC hâlâ bilinçli olarak dışarıda** (Seçenek B —
+   server-side transcoding — kod olarak hazır ve lokal test edilmiş ama
+   ayrıca ele alınmadı; bu FLAC kararı bu değişiklikle yeniden gözden
+   geçirilmedi, kasıtlı olarak öyle bırakıldı).
 5. ✅ **Çözüldü/düzeltildi — sessiz hata yutma:** `_diarize_with_claude` zaten
    `logger.exception` ile logluyormuş; bu maddenin orijinal tespiti güncel
    değilmiş (security-agent doğrulaması).
@@ -202,6 +208,27 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
   bir etkisi bulunamadı (gerçek hedef kullanım senaryosu — gürültülü/düşük
   kaliteli kayıt — için ayrıca test edilmesi öneriliyor, bkz. BENCHMARK.md
   "Değerlendirme").
+- **Format genişletme + gerçek içerik doğrulaması (2026-07-28):** `ALLOWED_EXTS`
+  genişletildi — `.ogg` yeniden eklendi (yukarıdaki madde 4'e bkz.), yeni bir
+  `DVR_EXTS = {"dav"}` seti eklendi (Dahua ve benzeri DVR/güvenlik kamerası
+  kayıtları — H.264 video + G.711/G.726 ses, best-effort: standart bir
+  konteyner değil, ffmpeg/libav çoğunlukla ama garanti olmadan decode edebilir).
+  `flac` hâlâ dışarıda (madde 4). Yeni `_verify_media_stream()`, her
+  `/api/transcribe` isteğinde (TRANSCRIPTION_BACKEND'den bağımsız, hem api hem
+  local mode'da) uzantıya güvenmek yerine dosyanın gerçekten decode edilebilir
+  bir ses stream'i içerip içermediğini kontrol ediyor — `ffprobe` CLI'ı
+  yerine `PyAV` (`av`) kullanıyor (aynı libav altyapısı, ama sistemde ffmpeg/
+  ffprobe binary'si gerektirmiyor — `_decode_waveform_for_pyannote`'la aynı
+  gerekçe). `av` kurulu değilse (teoride "api"-only bir deploy'da olabilir,
+  ama şu an Docker image'ı zaten kuruyor — madde 3'teki bloat notuna bkz.)
+  sessizce eski uzantı-bazlı davranışa düşüyor, hard-fail olmuyor. `.dav`
+  içerik doğrulaması başarısız olursa jenerik "desteklenmiyor" yerine net,
+  actionable bir 400 dönüyor ("VLC ile dönüştürüp tekrar deneyin"). Test:
+  `backend/tests/test_media_validation.py` (yeni dosya) — gerçek bir PyAV'la
+  sentezlenmiş minimal Ogg/Vorbis dosyasıyla kabul senaryosu dahil (gerçek
+  bir `.dav` örneği bulunamadı/pratik değildi — o senaryo bozuk/sahte byte'larla
+  test edildi, bkz. dosyanın modül docstring'i). Tam paket: 28 test geçti,
+  4 skip, 0 hata.
 
 ## Sabit Kurallar (Claude Code her zaman uymalı)
 
@@ -211,9 +238,9 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
 - MongoDB kaldırıldı (yukarıdaki "Mevcut Mimari" notuna bakın) — yeniden
   eklenecekse karar önce `memory/PRD.md`'de gerekçelendirilsin, sessizce
   eklenmesin.
-- Her değişiklik sonrası `backend/tests/backend_test.py` VE
-  `backend/tests/test_local_mode.py` çalıştırılıp doğrulansın (`pytest tests/`
-  ikisini birden çalıştırır).
+- Her değişiklik sonrası `backend/tests/backend_test.py`,
+  `backend/tests/test_local_mode.py` VE `backend/tests/test_media_validation.py`
+  çalıştırılıp doğrulansın (`pytest tests/` üçünü birden çalıştırır).
 - Gerçek Whisper/Claude API çağrısı gerektiren testler var — bu testleri kırmadan
   önce PRD.md'deki test senaryolarını oku.
 - Kod tabanı şu an "tek dosya, tek bileşen" yapısında — refactor yaparken

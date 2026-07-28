@@ -283,3 +283,58 @@ Sıralama: security → cleanup → consistency → test → infra → docs (CLA
   doğru değerin seçildiği doğrulanıyor). Tam paket: 21 test geçti, 4 skip,
   0 hata; canlı sunucuya karşı gerçek bir `/api/transcribe` isteğiyle de
   (local mode, `WHISPER_MODEL_SIZE=tiny`) uçtan uca doğrulandı.
+
+**2026-07-28 — desteklenen dosya formatları genişletildi + gerçek içerik doğrulaması**
+- `ALLOWED_EXTS` genişletildi: **`.ogg` yeniden eklendi** — daha önce
+  consistency-agent tarafından flac ile birlikte kapatılmıştı (P2 backlog,
+  bkz. yukarıdaki ilgili girdi), ama bu değişiklik onu bloke eden iki şeyi de
+  kapattı: infra-agent'ın Docker build'inde ffmpeg'in kurulu olduğunu zaten
+  doğrulamış olması VE aşağıdaki yeni `_verify_media_stream()`'in gerçek
+  içerik doğrulaması sağlaması. **`.flac` bilinçli olarak hâlâ dışarıda** —
+  bu karar bu değişiklikle yeniden gözden geçirilmedi. Yeni bir
+  **`DVR_EXTS = {"dav"}`** seti eklendi: Dahua ve benzeri DVR/güvenlik
+  kamerası kayıtları (genelde H.264 video + G.711/G.726 ses) — standart bir
+  konteyner olmadığı için diğer setlerden farklı olarak **best-effort,
+  garanti değil** olarak işaretlendi.
+- Yeni **`_verify_media_stream(raw_bytes, ext)`** fonksiyonu: her
+  `/api/transcribe` isteğinde (TRANSCRIPTION_BACKEND'den bağımsız — hem api
+  hem local mode), dosya uzantısına güvenmek yerine gerçekten decode
+  edilebilir bir ses akışı içerip içermediğini kontrol ediyor. `ffprobe` CLI
+  binary'sine subprocess ile gitmek yerine **PyAV (`av`)** kullanıyor — aynı
+  altta yatan libav decode makinesi (ffprobe'un da üzerine kurulu olduğu),
+  ama sistemde ayrıca bir `ffmpeg`/`ffprobe` binary'si PATH'te olmasını
+  gerektirmiyor (`_decode_waveform_for_pyannote`'ın zaten kullandığı aynı
+  yaklaşım/gerekçe). `av` faster-whisper'ın transitive bağımlılığı olduğu
+  için opsiyonel: kurulu değilse (teoride API-only bir deploy'da olabilir)
+  sessizce eski uzantı-bazlı davranışa düşüyor, "api" modunun temel
+  yolunu hard-fail etmiyor. İçerik doğrulaması başarısız olursa: `.dav` için
+  ayrı, actionable bir 400 ("Bu DVR kaydı işlenemedi... VLC ile dönüştürüp
+  tekrar deneyin"), diğerleri için genel bir "ses akışı bulunamadı" 400'ü.
+- Frontend (`Transcriber.jsx`): `AUDIO_EXTRA`'ya `ogg`, yeni `DVR_EXT = ["dav"]`
+  eklendi (`VIDEO_SET`'e de dahil edildi — dosya seçilince "Video · Ses
+  ayıklanacak" etiketi `.dav` için de görünsün diye), kullanıcıya gösterilen
+  format listeleri güncellendi.
+- Test: yeni `backend/tests/test_media_validation.py` — `_verify_media_stream`'i
+  doğrudan (canlı sunucu olmadan) test ediyor. Gerçek bir `.dav` örneği
+  bulunamadı/pratik değildi (ne erişilebilir bir örnek kayıt var, ne de PyAV
+  bir DVR vendor'ının kullandığı codec'i encode edebiliyor) — o senaryo
+  kasıtlı olarak bozuk/decode-edilemez byte'larla test edildi. Ama **gerçek,
+  mock'suz bir pozitif senaryo da var**: PyAV'ın kendi `vorbis` encoder'ı ile
+  (sistemde ffmpeg olmadan) gerçek, geçerli, minimal bir Ogg/Vorbis dosyası
+  sentezlenip `_verify_media_stream`'in bunu gerçekten kabul ettiği
+  doğrulandı — sadece "reddediyor" değil "gerçek içeriği kabul ediyor" da
+  test edildi. `backend_test.py`'deki eski `test_rejects_ogg_with_clear_400`
+  `test_accepts_ogg_extension_but_rejects_undecodable_content` olarak
+  yeniden yazıldı (artık uzantı kabul ediliyor, sahte byte'lar içerik
+  kontrolünde reddediliyor) + yeni `test_rejects_undecodable_dav_with_
+  actionable_message` eklendi. `test_local_mode.py`'deki bir test
+  (`test_transcribe_endpoint_never_calls_diarize_local`, sahte "fake wav
+  bytes" kullanıyordu) yeni content-validation'ı da mock'layacak şekilde
+  güncellendi. Tam paket: 28 test geçti, 4 skip, 0 hata.
+- Not: `.ogg`/`.dav` gibi transcode gerektiren formatların **gerçek uçtan uca**
+  (tam transkripsiyon) doğrulaması bu geliştirme ortamında yapılamadı —
+  burada sistemde `ffmpeg` binary'si kurulu değil (pydub'ın `AudioSegment.
+  from_file` için hâlâ gerektirdiği, `_verify_media_stream`'den bağımsız bir
+  ihtiyaç). Docker image'ında ffmpeg zaten kurulu (infra-agent doğrulaması) —
+  gerçek bir `.dav`/`.ogg` dosyasıyla tam pipeline'ın orada test edilmesi
+  öneriliyor.

@@ -25,10 +25,12 @@ const API_KEY = process.env.REACT_APP_API_KEY;
 // Native Whisper formats
 const AUDIO_NATIVE = ["mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"];
 // Extra audio containers (server transcodes via ffmpeg)
-// NOTE: flac/ogg intentionally excluded — kept in sync with backend/server.py
-// EXTRA_AUDIO_EXTS (consistency-agent, see memory/PRD.md backlog for why).
+// NOTE: flac intentionally still excluded — kept in sync with backend/server.py
+// EXTRA_AUDIO_EXTS (see memory/PRD.md backlog for why). ogg was excluded for
+// the same reason but is re-enabled now that the backend independently
+// verifies real stream content (_verify_media_stream) before transcoding.
 const AUDIO_EXTRA = [
-  "oga", "opus", "aac", "wma",
+  "ogg", "oga", "opus", "aac", "wma",
   "aiff", "aif", "aifc", "amr", "ac3", "au", "caf",
   "3ga", "voc", "mka", "mp2",
 ];
@@ -38,8 +40,12 @@ const VIDEO_EXT = [
   "m4v", "mpg", "mpe", "vob", "ogv", "mts", "m2ts",
   "ts", "asf", "f4v",
 ];
-const ALLOWED_EXT = [...AUDIO_NATIVE, ...AUDIO_EXTRA, ...VIDEO_EXT];
-const VIDEO_SET = new Set(VIDEO_EXT);
+// DVR/security-camera recordings — best-effort, not guaranteed (see
+// backend/server.py DVR_EXTS comment); .dav gets a distinct, actionable
+// error message from the backend if its codec can't be decoded.
+const DVR_EXT = ["dav"];
+const ALLOWED_EXT = [...AUDIO_NATIVE, ...AUDIO_EXTRA, ...VIDEO_EXT, ...DVR_EXT];
+const VIDEO_SET = new Set([...VIDEO_EXT, ...DVR_EXT]);
 const ACCEPT_ATTR = "audio/*,video/*," + ALLOWED_EXT.map((e) => `.${e}`).join(",");
 // Single source of truth: backend/server.py MAX_UPLOAD_SIZE (500 MB). Keep in
 // sync by hand — frontend and backend are separate apps with no shared package.
@@ -287,7 +293,7 @@ export default function Transcriber() {
                   <div className="inline-flex items-center gap-2 border border-black/15 bg-[#FAFAFA] px-3 py-1.5">
                     <span className="tech-label !text-[10px]">Ses</span>
                     <span className="font-mono text-xs">
-                      mp3 · wav · m4a · opus · aac …
+                      mp3 · wav · m4a · opus · ogg · aac …
                     </span>
                   </div>
                   <div className="inline-flex items-center gap-2 border border-black/15 bg-[#FAFAFA] px-3 py-1.5">
@@ -295,6 +301,10 @@ export default function Transcriber() {
                     <span className="font-mono text-xs">
                       mp4 · mov · mkv · avi · webm · flv …
                     </span>
+                  </div>
+                  <div className="inline-flex items-center gap-2 border border-black/15 bg-[#FAFAFA] px-3 py-1.5">
+                    <span className="tech-label !text-[10px]">DVR</span>
+                    <span className="font-mono text-xs">dav</span>
                   </div>
                 </div>
                 <div className="mt-3 tech-label !text-[10px]">
@@ -552,7 +562,7 @@ export default function Transcriber() {
             {
               n: "02",
               t: "Çoklu Format",
-              d: "Ses (mp3, wav, opus, aac…) ve video (mp4, mov, mkv…) — hepsi otomatik.",
+              d: "Ses (mp3, wav, opus, ogg, aac…), video (mp4, mov, mkv…) ve DVR kayıtları (.dav) — hepsi otomatik.",
             },
             {
               n: "03",

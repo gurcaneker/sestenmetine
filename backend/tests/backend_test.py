@@ -85,19 +85,24 @@ class TestTranscribeValidation:
         assert r.status_code in (400, 422)
 
     def test_rejects_flac_with_clear_400(self, session):
-        """FLAC/OGG were removed from ALLOWED_EXTS by consistency-agent: the
-        Whisper wrapper doesn't accept these formats natively, and while
-        pydub/ffmpeg CAN transcode them (verified locally with a working
-        ffmpeg+ffprobe toolchain), a 500 with a raw provider error string
-        reached users whenever the deploy environment lacked a working
-        ffmpeg/ffprobe on PATH — a leaky, hard-to-diagnose failure mode.
-        Until that infra dependency is confirmed and Option B (server-side
-        transcoding, see memory/PRD.md backlog) is re-enabled, .flac/.ogg
-        must fail fast with a clear 400 — same as any other unsupported
-        extension. Was test_transcribe_flac_reports_error_gracefully in
-        TestTranscribeReal (needed a real API call); moved here because the
-        rejection now happens at the extension-validation step, before any
-        Whisper/Claude call is made."""
+        """FLAC was removed from ALLOWED_EXTS by consistency-agent: the
+        Whisper wrapper doesn't accept it natively, and while pydub/ffmpeg
+        CAN transcode it (verified locally with a working ffmpeg+ffprobe
+        toolchain), a 500 with a raw provider error string reached users
+        whenever the deploy environment lacked a working ffmpeg/ffprobe on
+        PATH — a leaky, hard-to-diagnose failure mode. Until that infra
+        dependency is confirmed and Option B (server-side transcoding, see
+        memory/PRD.md backlog) is re-enabled, .flac must fail fast with a
+        clear 400 — same as any other unsupported extension. Was
+        test_transcribe_flac_reports_error_gracefully in TestTranscribeReal
+        (needed a real API call); moved here because the rejection now
+        happens at the extension-validation step, before any Whisper/Claude
+        call is made.
+
+        Note: .ogg used to be rejected the same way (see git history) but was
+        re-enabled once _verify_media_stream() gave the backend a real,
+        content-based check independent of the ffmpeg-availability concern
+        above — see test_accepts_ogg_extension_but_rejects_undecodable_content."""
         files = {"file": ("jfk.flac", b"fake flac bytes - never decoded", "audio/flac")}
         r = session.post(f"{API}/transcribe", files=files, data={"language": "en"}, headers=AUTH_HEADERS, timeout=30)
         assert r.status_code == 400
@@ -105,14 +110,31 @@ class TestTranscribeValidation:
         assert "Desteklenmeyen" in detail
         assert "flac" in detail.lower()
 
-    def test_rejects_ogg_with_clear_400(self, session):
-        """See test_rejects_flac_with_clear_400 — same fix, .ogg extension."""
+    def test_accepts_ogg_extension_but_rejects_undecodable_content(self, session):
+        """.ogg is now in ALLOWED_EXTS (re-enabled, see test_rejects_flac_
+        with_clear_400's note) — this fake payload isn't real Ogg content, so
+        it should pass the extension check and then get caught by
+        _verify_media_stream's real content probe instead, with a 400 that's
+        NOT the generic "Desteklenmeyen dosya formatı" (that would mean the
+        extension itself was rejected, which is the regression this guards
+        against)."""
         files = {"file": ("clip.ogg", b"fake ogg bytes - never decoded", "audio/ogg")}
         r = session.post(f"{API}/transcribe", files=files, data={"language": "en"}, headers=AUTH_HEADERS, timeout=30)
         assert r.status_code == 400
         detail = r.json().get("detail", "")
-        assert "Desteklenmeyen" in detail
-        assert "ogg" in detail.lower()
+        assert "Desteklenmeyen" not in detail
+        assert "ses akışı bulunamadı" in detail.lower() or "işlenemedi" in detail.lower()
+
+    def test_rejects_undecodable_dav_with_actionable_message(self, session):
+        """.dav (DVR/security-camera recordings) gets its own actionable
+        error message (not the generic one) when the content can't be
+        decoded — see _verify_media_stream's DVR_EXTS branch."""
+        files = {"file": ("recording.dav", b"fake dav bytes - never decoded", "video/x-dav")}
+        r = session.post(f"{API}/transcribe", files=files, data={"language": "en"}, headers=AUTH_HEADERS, timeout=30)
+        assert r.status_code == 400
+        detail = r.json().get("detail", "")
+        assert "DVR" in detail
+        assert "VLC" in detail
 
     # --- auth (missing/wrong API key never consumes rate-limit budget: ---
     # --- require_api_key runs as a route dependency BEFORE the rate-  ---
