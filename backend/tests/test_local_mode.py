@@ -15,6 +15,7 @@ This was manually verified once, for real, while building this feature
 (faster-whisper 'tiny' + a real HF token against test_fixtures/jfk.wav) —
 see memory/PRD.md changelog for what that confirmed.
 """
+import os
 import sys
 import types
 from pathlib import Path
@@ -86,6 +87,13 @@ class TestLocalModeConfig:
         _get_local_whisper_model) — NOT at module scope — so this must
         succeed even without those packages installed."""
         _fake_local_mode_env(monkeypatch)
+        # Explicitly clear WHISPER_MODEL_SIZE: when this file runs in the same
+        # xdist worker as backend_test.py, that module's load_dotenv(backend/.env)
+        # call has already populated os.environ for the whole process — and
+        # backend/.env may have WHISPER_MODEL_SIZE=tiny set (used for faster
+        # manual local-mode testing) — which would otherwise leak in here and
+        # break this test's assertion about the *default* value non-deterministically.
+        monkeypatch.delenv("WHISPER_MODEL_SIZE", raising=False)
         server = _reload_server()
         assert server.TRANSCRIPTION_BACKEND == "local"
         assert server.WHISPER_MODEL_SIZE == "small"
@@ -150,9 +158,11 @@ class TestLocalPipelineMocked:
 
         fake_module.WhisperModel.assert_called_once_with(
             server.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8",
+            cpu_threads=os.cpu_count() or 4,
         )
         fake_model.transcribe.assert_called_once()
         assert fake_model.transcribe.call_args.kwargs.get("language") == "tr"
+        assert fake_model.transcribe.call_args.kwargs.get("vad_filter") is True
         assert raw_text == "Merhaba dünya"
         assert segments == [{"start": 0.0, "end": 1.5, "text": "Merhaba dünya"}]
 
@@ -192,6 +202,45 @@ class TestLocalPipelineMocked:
         )
         fake_pipeline_instance.assert_called_once_with(fake_waveform_dict)
         assert segments == [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}]
+
+
+class TestLocalModeDiarizationDisabled:
+    """Diarization is currently disabled in local mode (CPU-time cost on the
+    target VPS, no GPU) — /api/transcribe must not call _diarize_local and
+    must always return diarized_text: None. _diarize_local /
+    _align_and_format_diarization themselves are left untouched (see
+    server.py comment above the commented-out call) so this is purely about
+    the endpoint not invoking them — see CLAUDE.md "Bilinen Kritik Sorunlar"
+    for how to re-enable."""
+
+    def test_transcribe_endpoint_never_calls_diarize_local(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        fake_whisper_segments = [{"start": 0.0, "end": 1.0, "text": "Merhaba"}]
+        with patch.object(
+            server, "_transcribe_local", return_value=("Merhaba", fake_whisper_segments)
+        ) as mock_transcribe, patch.object(
+            server, "_diarize_local"
+        ) as mock_diarize, patch.object(
+            server, "_align_and_format_diarization"
+        ) as mock_align:
+            client = TestClient(server.app)
+            resp = client.post(
+                "/api/transcribe",
+                headers={"X-API-Key": "test-key"},
+                files={"file": ("test.wav", b"fake wav bytes", "audio/wav")},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["text"] == "Merhaba"
+        assert body["diarized_text"] is None
+        mock_transcribe.assert_called_once()
+        mock_diarize.assert_not_called()
+        mock_align.assert_not_called()
 
 
 @REQUIRES_REAL_MODELS

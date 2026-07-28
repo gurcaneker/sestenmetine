@@ -102,9 +102,20 @@ başlatmak yetmez.
 
 Varsayılan davranış (`TRANSCRIPTION_BACKEND=api`) OpenAI Whisper API +
 Anthropic Claude kullanır (`EMERGENT_LLM_KEY` gerekir). Alternatif olarak
-`TRANSCRIPTION_BACKEND=local` ile transkripsiyon (**faster-whisper**) ve
-konuşmacı ayrımı (**pyannote.audio**) tamamen yerelde, ilk model
-indirmesinden sonra **offline** çalışır — `EMERGENT_LLM_KEY` gerekmez.
+`TRANSCRIPTION_BACKEND=local` ile transkripsiyon (**faster-whisper**)
+tamamen yerelde, ilk model indirmesinden sonra **offline** çalışır —
+`EMERGENT_LLM_KEY` gerekmez.
+
+> ⚠️ **Diarization (konuşmacı ayrımı) local mode'da şu an devre dışı.**
+> `_diarize_local()`/pyannote.audio uçtan uca doğrulandı ve çalışıyor
+> (aşağıdaki adımlar hâlâ geçerli, kod silinmedi), ama hedef deploy ortamı
+> (VPS, GPU yok) için Whisper'ın üzerine pyannote'un CPU maliyeti kabul
+> edilemez derecede yüksek çıktı — bu yüzden endpoint artık onu hiç
+> çağırmıyor, `diarized_text` local mode'da her zaman `null` döner. Yeniden
+> açmak için `backend/server.py`'de `transcribe_audio()` içindeki, yorum
+> satırına alınmış `_diarize_local`/`_align_and_format_diarization` çağrı
+> bloğunun yorumunu kaldırın (bkz. kod yorumu). API mode (Claude ile
+> diarization) bundan etkilenmedi, aynı şekilde çalışmaya devam ediyor.
 
 **1) Hugging Face token alın (manuel, siz yapmalısınız):**
 1. https://huggingface.co adresinde hesap oluşturun/giriş yapın.
@@ -136,8 +147,14 @@ gerekir); sonraki çalıştırmalar bu cache'i kullanır, network gerekmez.
 CPU üzerinde int8 quantization ile çalışır — GPU gerekmez ama `small`/`medium`
 modelleri ile transkripsiyon API moduna göre belirgin şekilde daha yavaştır.
 
-Diarization pipeline'ı yüklenemez/başarısız olursa (örn. token/erişim sorunu),
-istek **başarısız olmaz** — `_diarize_with_claude`'un API-mode'daki davranışıyla
+Yukarıdaki HF_TOKEN adımları diarization şu an kapalıyken de geçerli:
+`TRANSCRIPTION_BACKEND=local` fail-fast mantığı hâlâ `HF_TOKEN` bekliyor
+(ileride tekrar açılabilmesi için bilinçli olarak kaldırılmadı — bkz.
+yukarıdaki devre dışı bırakma notu).
+
+Diarization yeniden açıldığında geçerli olacak davranış (kod hazır, aşağıdaki
+gibi uçtan uca doğrulandı): pipeline yüklenemez/başarısız olursa istek
+**başarısız olmaz** — `_diarize_with_claude`'un API-mode'daki davranışıyla
 aynı: hata loglanır, `diarized_text: null` ile düz transkript dönülür. Ses,
 pyannote'a dosya yolu yerine `av` ile kendi decode ettiğimiz bir waveform
 olarak veriliyor, bu yüzden diarization için sistemde ayrıca ffmpeg kurulu

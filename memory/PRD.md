@@ -207,3 +207,34 @@ Sıralama: security → cleanup → consistency → test → infra → docs (CLA
   `@pytest.mark.skip` ile işaretlendi (yukarıdaki manuel doğrulamaya
   referans veriyor). Mevcut `backend_test.py` (api modu) değişmeden geçmeye
   devam ediyor — 19 test geçti, 4 skip, 0 hata.
+
+**2026-07-28 — local mode'da diarization devre dışı bırakıldı**
+- Diarization (yukarıdaki round'da uçtan uca doğrulanmış, çalışır durumdaki
+  `_diarize_local`/`_align_and_format_diarization`) local mode'da **devre dışı
+  bırakıldı**: hedef deploy ortamı GPU'suz bir VPS, ve pyannote.audio'nun
+  Whisper'ın üzerine eklediği CPU süresi kabul edilemez bulundu. Local mode'un
+  önceliği artık sadece transkripsiyon hız/doğruluğu — konuşmacı ayrımı olmadan.
+- Kod **silinmedi**: `backend/server.py`'nin `transcribe_audio()` fonksiyonunda
+  `_diarize_local`/`_align_and_format_diarization` çağrısı yorum satırına
+  alındı, net bir açıklayıcı yorumla neden ve nasıl geri açılacağı belirtildi.
+  `diarized_text` local modda artık her zaman `null`. `HF_TOKEN` fail-fast
+  kontrolü de kasıtlı olarak kaldırılmadı (ileride tekrar açılabilsin diye).
+- `_transcribe_local()`'a doğruluğu koruyan/artıran iki faster-whisper ayarı
+  eklendi: `vad_filter=True` (sessizlik atlama — hız + doğruluk, yanlış
+  transkript üretmiyor) ve `WhisperModel(cpu_threads=os.cpu_count())` (mevcut
+  donanımı tam kullan). `beam_size`'a bilinçli olarak dokunulmadı — bu bir
+  doğruluk/hız trade-off'u ve kullanıcı doğruluğu önceliklendirdi.
+- Frontend (`Transcriber.jsx`) değişmedi: `hasDiarization = Boolean(result
+  ?.diarized_text)` zaten `null` durumunu handle ediyor, diarization UI'ı
+  otomatik gizleniyor — teyit edildi, ek değişiklik gerekmedi.
+- Test: `test_local_mode.py`'ye yeni bir sınıf eklendi
+  (`TestLocalModeDiarizationDisabled`) — `TestClient` ile `/api/transcribe`'ı
+  local modda çağırıp `_diarize_local`/`_align_and_format_diarization`'ın hiç
+  çağrılmadığını ve `diarized_text`'in `null` döndüğünü doğruluyor. Mevcut
+  `_transcribe_local` mock testi yeni `vad_filter`/`cpu_threads` argümanlarını
+  doğrulayacak şekilde güncellendi. Ayrıca bağımsız bir flake düzeltildi:
+  `test_local_mode_imports_without_error`, `backend/.env`'deki
+  `WHISPER_MODEL_SIZE=tiny` (önceki manuel doğrulama turundan kalma) aynı
+  xdist worker'da `backend_test.py`'nin `load_dotenv` çağrısından sızıp
+  testi non-deterministik kırıyordu — artık `WHISPER_MODEL_SIZE` testte
+  açıkça `delenv` ediliyor. Tam paket: 20 test geçti, 4 skip, 0 hata.

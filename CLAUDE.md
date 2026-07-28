@@ -50,8 +50,10 @@ sestenmetine/
 - **Backend:** FastAPI 0.110 + uvicorn, pydub (ffmpeg), emergentintegrations
   (Whisper + Claude wrapper), slowapi (rate limiting), pytest + pytest-xdist.
   `TRANSCRIPTION_BACKEND=local` (opsiyonel, default `api`) ile faster-whisper
-  + pyannote.audio kullanan tamamen yerel/offline bir mod da var —
-  `EMERGENT_LLM_KEY` gerektirmez, `HF_TOKEN` gerektirir. Ağır bağımlılıklar
+  kullanan tamamen yerel/offline bir mod da var — `EMERGENT_LLM_KEY`
+  gerektirmez. pyannote.audio ile diarization kodu da mevcut ama **şu an
+  devre dışı** (bkz. aşağıdaki "İş akışı" notu); `HF_TOKEN` fail-fast kontrolü
+  bilinçli olarak kaldırılmadı. Ağır bağımlılıklar
   (`torch` dahil) `server.py` içinde lazy-import edilir, "api" modunu
   etkilemez. Bkz. README.md "Local mode ile çalıştırma".
 - **Frontend:** React 19 + react-router-dom 7, shadcn/ui, Tailwind, framer-motion,
@@ -87,11 +89,13 @@ format/boyut doğrula, transcode/chunk, Whisper'a gönder, birleştir →
 konuşmacı ayrımı yaptır (hata durumunda sessizce None dönüyor).
 
 İş akışı (`TRANSCRIPTION_BACKEND=local`): aynı format/boyut doğrulaması →
-`_transcribe_local()` (faster-whisper, segment+timestamp'li) →
-`_diarize_local()` (pyannote.audio) → `_align_and_format_diarization()`
-(zaman-örtüşmesine göre hizala, "1. kişi/2. kişi" formatına çevir — aynı
-sözleşme, diarization başarısız olursa yine sessizce None). Detay: README.md
-"Local mode ile çalıştırma".
+`_transcribe_local()` (faster-whisper, `vad_filter=True` + `cpu_threads=
+os.cpu_count()`, segment+timestamp'li) → `diarized_text` her zaman `null`
+döner. **Diarization (`_diarize_local()` + `_align_and_format_diarization()`)
+şu an devre dışı** — hedef VPS'te (GPU yok) pyannote'un CPU maliyeti kabul
+edilemez bulundu; kod silinmedi, `transcribe_audio()` içinde çağrı yorum
+satırına alındı (bkz. kod yorumu ve README.md "Local mode ile çalıştırma"
+— yeniden açma talimatı orada). API mode bundan etkilenmez.
 
 ## Bilinen Kritik Sorunlar
 
@@ -162,6 +166,21 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
   bir `requirements-local.txt`'e taşıyıp Docker build'e opsiyonel bir
   `ARG`/build-stage ile bağlamak (yapılırsa `docker-compose.yml` ve
   `backend/Dockerfile` güncellenmeli).
+- **Local mode'da diarization devre dışı bırakıldı (2026-07-28):**
+  `_diarize_local()`/`_align_and_format_diarization()` uçtan uca doğrulanmış
+  ve çalışır durumdaydı, ama hedef VPS'te GPU olmadığı için pyannote.audio'nun
+  Whisper'ın üzerine eklediği CPU süresi kabul edilemez bulundu — bu proje
+  local mode'u önceliği doğruluk/hız olan bir transkripsiyon aracı olarak
+  kullanıyor, diarization olmadan da hedefine ulaşıyor. `transcribe_audio()`
+  içinde `_diarize_local` çağrısı yorum satırına alındı, `diarized_text` local
+  modda her zaman `null` döner (frontend zaten `Boolean(diarized_text)` ile
+  kontrol ediyor, ek değişiklik gerekmedi). `_transcribe_local()`'a doğruluğu
+  koruyan/artıran iki ayar eklendi: `vad_filter=True` (sessizlik atlama) ve
+  `cpu_threads=os.cpu_count()`; `beam_size`'a dokunulmadı (doğruluk/hız
+  trade-off'u, doğruluk önceliklendirildi). Yeniden açmak için: server.py'de
+  ilgili yorum satırındaki bloğun yorumunu kaldırın — kod ve testler
+  (`test_diarize_local_calls_pyannote_with_token`) hâlâ mevcut ve çalışıyor.
+  API mode (Claude ile diarization) hiç etkilenmedi.
 
 ## Sabit Kurallar (Claude Code her zaman uymalı)
 

@@ -262,6 +262,7 @@ def _get_local_whisper_model():
         )
         _local_whisper_model = WhisperModel(
             WHISPER_MODEL_SIZE, device="cpu", compute_type="int8",
+            cpu_threads=os.cpu_count() or 4,  # use all available cores
         )
     return _local_whisper_model
 
@@ -299,7 +300,14 @@ def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str]):
         tmp.write(raw_bytes)
         tmp_path = tmp.name
     try:
-        segments_iter, _info = model.transcribe(tmp_path, language=lang_code)
+        segments_iter, _info = model.transcribe(
+            tmp_path,
+            language=lang_code,
+            vad_filter=True,  # skip silence — faster, and avoids hallucinated
+            # text on silent stretches (never changes accuracy on real speech)
+            # beam_size intentionally left at faster-whisper's default: this
+            # is an accuracy/speed trade-off and accuracy is prioritized here.
+        )
         whisper_segments: List[dict] = []
         texts: List[str] = []
         for seg in segments_iter:
@@ -486,15 +494,20 @@ async def transcribe_audio(
             logger.exception("Local transcription failed")
             raise HTTPException(status_code=500, detail=f"Yerel transkripsiyon başarısız: {str(e)}")
 
+        # Diarization (_diarize_local) is intentionally NOT called in local
+        # mode: pyannote.audio adds substantial CPU time on top of Whisper
+        # (no GPU on the target VPS), and the transcription-accuracy work
+        # this mode exists for doesn't need speaker labels. diarized_text is
+        # always None here. The pipeline code above (_diarize_local,
+        # _align_and_format_diarization) is left in place, untouched, so
+        # this can be re-enabled later by uncommenting the block below —
+        # see CLAUDE.md / README.md "Local mode" for how to turn it back on.
         diarized_text = None
-        try:
-            diar_segments = _diarize_local(contents, ext)
-            diarized_text = _align_and_format_diarization(whisper_segments, diar_segments)
-        except Exception:
-            # Same soft-fail contract as _diarize_with_claude: diarization
-            # failing shouldn't take down a transcription that otherwise
-            # succeeded — log it, return without speaker labels.
-            logger.exception("Local diarization failed")
+        # try:
+        #     diar_segments = _diarize_local(contents, ext)
+        #     diarized_text = _align_and_format_diarization(whisper_segments, diar_segments)
+        # except Exception:
+        #     logger.exception("Local diarization failed")
 
         return {
             "text": raw_text,
