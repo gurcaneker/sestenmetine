@@ -171,20 +171,34 @@ Sıralama: security → cleanup → consistency → test → infra → docs (CLA
   "1. kişi / 2. kişi" metin formatına dönüştürülüyor — frontend hiç
   değişmeden çalışıyor.
 - **Gerçek bir HF token'la (kullanıcı sağladı) manuel olarak uçtan uca
-  doğrulandı**: faster-whisper 'tiny' modeliyle `test_fixtures/jfk.wav`
-  gerçek transkripsiyon üretti; diarization pipeline'ı gerçekten yüklenmeye
-  çalışıldı. Bu süreçte iki gerçek sorun bulunup düzeltildi:
+  doğrulandı — konuşmacı ayrımı da dahil, gerçekten çalışan `diarized_text`
+  ile.** Bu süreçte dört gerçek sorun bulunup düzeltildi:
   1. `Pipeline.from_pretrained()`'ın kwarg'ı pyannote.audio 4.x'te
      `use_auth_token`'dan `token`'a değişmiş (kod düzeltildi).
   2. `pyannote/speaker-diarization-3.1`, 4.x'te ayrı ve gated bir modele
-     (`pyannote/speaker-diarization-community-1`) bağımlı — kullanıcı SADECE
-     3.1'in şartlarını kabul etmişti, community-1'inkini etmemişti, bu da
-     `403 GatedRepoError`'a yol açtı. README.md'ye bu adım netçe eklendi.
-  3. Bu erişim sorunu canlı endpoint üzerinden de test edildi: transkripsiyon
-     başarıyla tamamlandı, diarization `_diarize_with_claude` ile aynı
-     soft-fail sözleşmesiyle (`diarized_text: null`, hata loglanır, istek
-     500 ile çökmez) düzgün şekilde geri çekildi — istenen dayanıklılık
-     davranışı doğrulandı.
+     (`pyannote/speaker-diarization-community-1`) bağımlı — ilk denemede
+     kullanıcının token'ı sadece 3.1'e erişim onaylıydı, `403 GatedRepoError`
+     aldık (kullanıcı sonradan community-1'i de onayladı). README.md'ye bu
+     adım netçe eklendi.
+  3. pyannote 4.x dosya okuma için `torchcodec` kullanıyor, o da sistemde
+     kurulu ffmpeg paylaşımlı kütüphaneleri (`libavutil.so` vb.) gerektiriyor
+     — bu geliştirme makinesinde yok (Docker image'ında VAR, `apt-get install
+     ffmpeg`, bkz. `backend/Dockerfile`). Çözüm: `_decode_waveform_for_pyannote`
+     eklendi — ses, dosya yolu yerine `av` (faster-whisper'ın zaten bağımlılığı,
+     statik bağlı, sistem ffmpeg'i gerektirmiyor) ile kendimiz decode edilip
+     pyannote'a doğrudan `{'waveform': tensor, 'sample_rate': int}` olarak
+     veriliyor — pyannote'un kendi hata mesajının önerdiği tam olarak bu.
+  4. pyannote 4.x, pipeline çağrısından artık düz bir `Annotation` değil
+     `DiarizeOutput` dataclass'ı döndürüyor (`.speaker_diarization` alanı
+     asıl `Annotation`) — `_diarize_local` buna göre güncellendi.
+  Bu dört düzeltmeden sonra, JFK kaydı + gerçekten farklı bir ses (gTTS ile
+  sentezlenmiş, sadece bu manuel testi için — projeye eklenmedi) birleştirilen
+  bir dosyada `/api/transcribe` **doğru** `"1. kişi: ... / 2. kişi: ... /
+  1. kişi: ..."` çıktısını üretti — aynı konuşmacının tekrar göründüğünde
+  yeni bir numara almadığı (ilk-görünüş sırasına göre numaralandırma) da
+  doğrulandı. Diarization pipeline'ı gerçekten başarısız olduğunda (örn.
+  erişim sorunu) soft-fail sözleşmesi (`diarized_text: null`, hata loglanır,
+  istek 500 ile çökmez) de ayrıca doğrulanmıştı.
 - Test: `backend/tests/test_local_mode.py` (yeni dosya) — config/fail-fast
   senaryoları, `_align_and_format_diarization` (gerçek, mock'suz — saf
   mantık), `_transcribe_local`/`_diarize_local` (faster-whisper/

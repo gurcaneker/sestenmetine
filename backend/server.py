@@ -316,24 +316,52 @@ def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str]):
             pass
 
 
+def _decode_waveform_for_pyannote(raw_bytes: bytes):
+    """Decode raw audio bytes into the {'waveform': torch.Tensor (1, time)
+    float32 in [-1, 1], 'sample_rate': int} dict pyannote.audio accepts
+    directly (see pyannote.audio.core.io.Audio.__call__).
+
+    Decoding is done via PyAV (bundled with faster-whisper, statically
+    linked — no system ffmpeg needed), NOT by handing pyannote a file path:
+    pyannote.audio 4.x reads files via torchcodec, which dynamically links
+    against system libavutil/libavcodec — if those aren't installed (as on
+    this dev machine; they ARE installed via backend/Dockerfile's `apt-get
+    install ffmpeg` in the Docker image), file-path input raises
+    "torchcodec is not available". Decoding ourselves sidesteps that
+    entirely, matching the workaround pyannote's own error message suggests.
+    """
+    import av  # lazy: bundled with faster-whisper, see module note above
+    import torch
+    import numpy as np
+
+    container = av.open(io.BytesIO(raw_bytes))
+    stream = container.streams.audio[0]
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=stream.rate)
+    chunks = []
+    for frame in container.decode(stream):
+        for rframe in resampler.resample(frame):
+            chunks.append(rframe.to_ndarray())
+    container.close()
+
+    samples = np.concatenate(chunks, axis=1) if chunks else np.zeros((1, 0), dtype=np.int16)
+    waveform = torch.from_numpy(samples.astype(np.float32) / 32768.0)
+    return {"waveform": waveform, "sample_rate": stream.rate}
+
+
 def _diarize_local(raw_bytes: bytes, ext: str) -> List[dict]:
     """Run pyannote.audio on the uploaded bytes, return a list of
     {"start": float, "end": float, "speaker": str} turns."""
     pipeline = _get_local_diarization_pipeline()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
-        tmp.write(raw_bytes)
-        tmp_path = tmp.name
-    try:
-        diarization = pipeline(tmp_path)
-        return [
-            {"start": turn.start, "end": turn.end, "speaker": speaker}
-            for turn, _, speaker in diarization.itertracks(yield_label=True)
-        ]
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    audio_input = _decode_waveform_for_pyannote(raw_bytes)
+    output = pipeline(audio_input)
+    # pyannote.audio 4.x wraps the result in a DiarizeOutput dataclass
+    # instead of returning an Annotation directly (3.x behavior) —
+    # .speaker_diarization is the Annotation with .itertracks().
+    annotation = getattr(output, "speaker_diarization", output)
+    return [
+        {"start": turn.start, "end": turn.end, "speaker": speaker}
+        for turn, _, speaker in annotation.itertracks(yield_label=True)
+    ]
 
 
 def _align_and_format_diarization(

@@ -3,6 +3,11 @@
 # IDE and editors
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+.*.swp
+.*.swo
 
 # Dependencies
 node_modules/

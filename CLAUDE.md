@@ -26,7 +26,7 @@ sestenmetine/
 │   ├── Dockerfile        Python 3.11-slim + ffmpeg, --workers 1 (bkz. SECURITY_NOTES.md)
 │   ├── .env.example
 │   ├── pytest.ini
-│   └── tests/backend_test.py
+│   └── tests/backend_test.py, tests/test_local_mode.py
 ├── frontend/              React 19 (CRA + craco)
 │   ├── src/pages/Transcriber.jsx        Uygulamanın tüm mantığı (TEK BİLEŞEN)
 │   ├── src/pages/Transcriber.test.jsx   Jest + React Testing Library
@@ -80,10 +80,18 @@ sestenmetine/
 `/transcribe`, `X-API-Key` header gerektirir (401 eşleşmezse) ve IP başına
 5/dakika ile sınırlıdır (429 aşılırsa); `/` ve `/health` korumasız kalır.
 
-İş akışı: `_prepare_chunks()` → mono/16kHz downsample, ≤20MB parçalara böl →
-`transcribe_audio()` → format/boyut doğrula, transcode/chunk, Whisper'a gönder,
-birleştir → `_diarize_with_claude()` → Whisper çıktısını claude-sonnet-4-6'ya
-gönderip konuşmacı ayrımı yaptır (hata durumunda sessizce None dönüyor).
+İş akışı (`TRANSCRIPTION_BACKEND=api`, varsayılan): `_prepare_chunks()` →
+mono/16kHz downsample, ≤20MB parçalara böl → `transcribe_audio()` →
+format/boyut doğrula, transcode/chunk, Whisper'a gönder, birleştir →
+`_diarize_with_claude()` → Whisper çıktısını claude-sonnet-4-6'ya gönderip
+konuşmacı ayrımı yaptır (hata durumunda sessizce None dönüyor).
+
+İş akışı (`TRANSCRIPTION_BACKEND=local`): aynı format/boyut doğrulaması →
+`_transcribe_local()` (faster-whisper, segment+timestamp'li) →
+`_diarize_local()` (pyannote.audio) → `_align_and_format_diarization()`
+(zaman-örtüşmesine göre hizala, "1. kişi/2. kişi" formatına çevir — aynı
+sözleşme, diarization başarısız olursa yine sessizce None). Detay: README.md
+"Local mode ile çalıştırma".
 
 ## Bilinen Kritik Sorunlar
 
@@ -132,14 +140,28 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
   doğrulanmadı** — infra-agent görevine bakan biri bunu ilk fırsatta
   gerçek bir ortamda teyit etmeli.
 - **Local mode (faster-whisper + pyannote.audio) eklendi, gerçek bir HF
-  token'la test edildi — bir tuzak keşfedildi:** `pyannote/speaker-diarization-3.1`
-  pipeline'ı (pyannote.audio 4.x ile) arka planda AYRI ve gated bir modele
-  (`pyannote/speaker-diarization-community-1`) de bağımlı; sadece 3.1'in
-  şartlarını kabul etmek yetmiyor, token `403 GatedRepoError` ile
-  reddediliyor — kullanıcı community-1'in şartlarını da kabul etmeli (bkz.
-  README.md "Local mode" adım 3). Ayrıca `Pipeline.from_pretrained()`'ın
-  kwarg'ı artık `use_auth_token` değil `token` (pyannote.audio 4.x API
-  değişikliği, kodda düzeltildi).
+  token'la uçtan uca doğrulandı** — `diarized_text` gerçekten "1. kişi /
+  2. kişi" formatında dolu döndüğü dahil (bkz. `memory/PRD.md` changelog).
+  pyannote.audio 4.x ile ilgili dört gerçek uyumsuzluk bulunup düzeltildi:
+  `from_pretrained()`'ın kwarg'ı `use_auth_token`→`token`; `speaker-diarization-3.1`
+  ayrıca gated bir modele (`speaker-diarization-community-1`) bağımlı, o da
+  ayrıca onaylanmalı (README.md "Local mode" adım 3); dosya-yolu tabanlı okuma
+  `torchcodec`/sistem-ffmpeg gerektiriyor — `_decode_waveform_for_pyannote`
+  ile `av` üzerinden kendi decode edip pyannote'a waveform tensor'ü olarak
+  veriliyor (Docker image'ında ffmpeg zaten kurulu olduğu için orada bu
+  sorun yaşanmaz, ama kod artık ikisinde de çalışıyor); pipeline artık düz
+  `Annotation` değil `.speaker_diarization` alanlı bir `DiarizeOutput` dönüyor.
+- **⚠️ Docker image'ı artık local-mode bağımlılıklarını da (torch dahil,
+  ~GB seviyesinde) kuruyor — API-only deploy'lar için gereksiz şişkinlik:**
+  `faster-whisper`/`pyannote.audio` `requirements.txt`'te koşulsuz listeli
+  (server.py'de lazy-import ediliyor olması sadece Python import'unu
+  etkiler); `backend/Dockerfile`'ın `pip install -r requirements.rest.txt`
+  adımı bunları da kurar, `TRANSCRIPTION_BACKEND=api` ile hiç kullanılmasa
+  bile. infra-agent'ın Dockerfile'ı local mode'dan ÖNCE yazıldığı için bunu
+  hesaba katmadı. Düzeltilmedi — olası çözüm: local-mode paketlerini ayrı
+  bir `requirements-local.txt`'e taşıyıp Docker build'e opsiyonel bir
+  `ARG`/build-stage ile bağlamak (yapılırsa `docker-compose.yml` ve
+  `backend/Dockerfile` güncellenmeli).
 
 ## Sabit Kurallar (Claude Code her zaman uymalı)
 
@@ -149,7 +171,9 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
 - MongoDB kaldırıldı (yukarıdaki "Mevcut Mimari" notuna bakın) — yeniden
   eklenecekse karar önce `memory/PRD.md`'de gerekçelendirilsin, sessizce
   eklenmesin.
-- Her değişiklik sonrası `backend/tests/backend_test.py` çalıştırılıp doğrulansın.
+- Her değişiklik sonrası `backend/tests/backend_test.py` VE
+  `backend/tests/test_local_mode.py` çalıştırılıp doğrulansın (`pytest tests/`
+  ikisini birden çalıştırır).
 - Gerçek Whisper/Claude API çağrısı gerektiren testler var — bu testleri kırmadan
   önce PRD.md'deki test senaryolarını oku.
 - Kod tabanı şu an "tek dosya, tek bileşen" yapısında — refactor yaparken

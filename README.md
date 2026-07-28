@@ -138,7 +138,12 @@ modelleri ile transkripsiyon API moduna göre belirgin şekilde daha yavaştır.
 
 Diarization pipeline'ı yüklenemez/başarısız olursa (örn. token/erişim sorunu),
 istek **başarısız olmaz** — `_diarize_with_claude`'un API-mode'daki davranışıyla
-aynı: hata loglanır, `diarized_text: null` ile düz transkript dönülür.
+aynı: hata loglanır, `diarized_text: null` ile düz transkript dönülür. Ses,
+pyannote'a dosya yolu yerine `av` ile kendi decode ettiğimiz bir waveform
+olarak veriliyor, bu yüzden diarization için sistemde ayrıca ffmpeg kurulu
+olması gerekmiyor (Docker image'ında zaten var). Gerçek bir HF token ve
+birden fazla konuşmacı içeren bir kayıtla uçtan uca doğru "1. kişi / 2. kişi"
+çıktısı üretildiği manuel olarak test edildi — bkz. `memory/PRD.md` changelog.
 
 ## Test Çalıştırma
 

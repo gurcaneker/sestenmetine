@@ -160,12 +160,14 @@ class TestLocalPipelineMocked:
         _fake_local_mode_env(monkeypatch)
         server = _reload_server()
 
-        # _diarize_local calls pipeline(tmp_path) → an Annotation-like object
-        # with .itertracks() — i.e. the mock's __call__ result, not the mock
-        # returned by from_pretrained() itself.
+        # _diarize_local calls pipeline(audio_input) → a DiarizeOutput-like
+        # object whose .speaker_diarization is the Annotation with
+        # .itertracks() (pyannote.audio 4.x — see server.py comment).
         fake_turn = MagicMock(start=0.0, end=2.0)
         fake_pipeline_instance = MagicMock()
-        fake_pipeline_instance.return_value.itertracks.return_value = [(fake_turn, None, "SPEAKER_00")]
+        fake_pipeline_instance.return_value.speaker_diarization.itertracks.return_value = [
+            (fake_turn, None, "SPEAKER_00")
+        ]
         fake_pipeline_cls = MagicMock()
         fake_pipeline_cls.from_pretrained = MagicMock(return_value=fake_pipeline_instance)
 
@@ -173,15 +175,22 @@ class TestLocalPipelineMocked:
         fake_pyannote_audio = types.ModuleType("pyannote.audio")
         fake_pyannote_audio.Pipeline = fake_pipeline_cls
 
+        # _decode_waveform_for_pyannote (PyAV/torch/numpy) is mocked too —
+        # this test is about _diarize_local's own logic (pipeline call +
+        # output shaping), not audio decoding, which has no ML models
+        # involved and doesn't need mocking to be fast/deterministic
+        # (covered by the real end-to-end manual run — see PRD.md changelog).
+        fake_waveform_dict = {"waveform": "fake-tensor", "sample_rate": 16000}
         with patch.dict(sys.modules, {
             "pyannote": fake_pyannote_pkg,
             "pyannote.audio": fake_pyannote_audio,
-        }):
+        }), patch.object(server, "_decode_waveform_for_pyannote", return_value=fake_waveform_dict):
             segments = server._diarize_local(b"fake audio bytes", "wav")
 
         fake_pipeline_cls.from_pretrained.assert_called_once_with(
             "pyannote/speaker-diarization-3.1", token=server.HF_TOKEN,
         )
+        fake_pipeline_instance.assert_called_once_with(fake_waveform_dict)
         assert segments == [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}]
 
 
