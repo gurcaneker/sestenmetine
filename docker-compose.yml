@@ -1,0 +1,47 @@
+# NOT: MongoDB servisi burada YOK, bilinçli olarak eklenmedi. cleanup-agent
+# kararıyla backend'den MongoDB bağlantısı tamamen kaldırıldı (2026-07-23,
+# bkz. memory/PRD.md "Architecture" bölümü) — hiç CRUD/model kullanılmıyordu.
+# Kayıt geçmişi özelliği (P2 backlog) önceliklenirse bir DB servisi burada
+# yeniden değerlendirilmeli; o zamana kadar eklemek "kullanılmayan bağımlılık"
+# sorununu (bkz. SECURITY_NOTES.md, cleanup-agent) altyapı seviyesinde
+# tekrarlamak olur.
+
+services:
+  backend:
+    build:
+      context: ./backend
+    # Root .env'den (bkz. .env.example) API_KEY, EMERGENT_LLM_KEY,
+    # CORS_ORIGINS gibi değişkenleri container'a enjekte eder. API_KEY veya
+    # EMERGENT_LLM_KEY eksikse server.py başlangıçta RuntimeError ile
+    # çöker (bilinçli, security-agent kararı) — container "unhealthy" değil
+    # doğrudan "Exited" görünür, log'a bakın.
+    env_file:
+      - ./.env
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      # REACT_APP_* burada BUILD ARG olarak geçiyor, container'a env_file ile
+      # DEĞİL — CRA bunları derleme sırasında JS bundle'ına gömer (bkz.
+      # frontend/Dockerfile yorumu). Root .env'deki REACT_APP_BACKEND_URL
+      # boş bırakılırsa (varsayılan/önerilen Docker kurulumu) frontend
+      # backend'e /api relatif path'i üzerinden, nginx.conf'un reverse
+      # proxy'si aracılığıyla konuşur — CORS'a hiç gerek kalmaz (aynı origin).
+      args:
+        REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:-}
+        REACT_APP_API_KEY: ${REACT_APP_API_KEY:?REACT_APP_API_KEY .env icinde tanimli olmali (backend API_KEY ile ayni deger)}
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

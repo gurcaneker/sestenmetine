@@ -18,12 +18,17 @@ import { toast } from "sonner";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
+// NOTE: this ends up readable in the compiled browser bundle — it's not a
+// secret, just a crude anti-bot/anti-abuse gate. See README.md.
+const API_KEY = process.env.REACT_APP_API_KEY;
 
 // Native Whisper formats
 const AUDIO_NATIVE = ["mp3", "wav", "m4a", "webm", "mp4", "mpeg", "mpga"];
 // Extra audio containers (server transcodes via ffmpeg)
+// NOTE: flac/ogg intentionally excluded — kept in sync with backend/server.py
+// EXTRA_AUDIO_EXTS (consistency-agent, see memory/PRD.md backlog for why).
 const AUDIO_EXTRA = [
-  "flac", "ogg", "oga", "opus", "aac", "wma",
+  "oga", "opus", "aac", "wma",
   "aiff", "aif", "aifc", "amr", "ac3", "au", "caf",
   "3ga", "voc", "mka", "mp2",
 ];
@@ -36,7 +41,9 @@ const VIDEO_EXT = [
 const ALLOWED_EXT = [...AUDIO_NATIVE, ...AUDIO_EXTRA, ...VIDEO_EXT];
 const VIDEO_SET = new Set(VIDEO_EXT);
 const ACCEPT_ATTR = "audio/*,video/*," + ALLOWED_EXT.map((e) => `.${e}`).join(",");
-const MAX_SIZE_MB = 40;
+// Single source of truth: backend/server.py MAX_UPLOAD_SIZE (500 MB). Keep in
+// sync by hand — frontend and backend are separate apps with no shared package.
+const MAX_SIZE_MB = 500;
 
 const formatBytes = (bytes) => {
   if (!bytes && bytes !== 0) return "-";
@@ -106,7 +113,10 @@ export default function Transcriber() {
 
     try {
       const res = await axios.post(`${API}/transcribe`, form, {
-        headers: { "Content-Type": "multipart/form-data" },
+        headers: {
+          "Content-Type": "multipart/form-data",
+          ...(API_KEY ? { "X-API-Key": API_KEY } : {}),
+        },
         onUploadProgress: (evt) => {
           if (evt.total) {
             // Upload phase up to 60%, remainder simulates transcode + chunked transcription
@@ -277,7 +287,7 @@ export default function Transcriber() {
                   <div className="inline-flex items-center gap-2 border border-black/15 bg-[#FAFAFA] px-3 py-1.5">
                     <span className="tech-label !text-[10px]">Ses</span>
                     <span className="font-mono text-xs">
-                      mp3 · wav · m4a · flac · ogg · opus · aac …
+                      mp3 · wav · m4a · opus · aac …
                     </span>
                   </div>
                   <div className="inline-flex items-center gap-2 border border-black/15 bg-[#FAFAFA] px-3 py-1.5">
@@ -542,7 +552,7 @@ export default function Transcriber() {
             {
               n: "02",
               t: "Çoklu Format",
-              d: "Ses (mp3, wav, flac, ogg, opus…) ve video (mp4, mov, mkv…) — hepsi otomatik.",
+              d: "Ses (mp3, wav, opus, aac…) ve video (mp4, mov, mkv…) — hepsi otomatik.",
             },
             {
               n: "03",
