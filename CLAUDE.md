@@ -41,6 +41,7 @@ sestenmetine/
 ├── .github/workflows/ci.yml   Opsiyonel CI: backend pytest + frontend yarn test
 ├── memory/PRD.md          Ürün gereksinim dokümanı + değişiklik günlüğü (en değerli dokümantasyon)
 ├── SECURITY_NOTES.md      Auth/rate-limit değerlendirmesi + implementasyon detayı
+├── BENCHMARK.md           Local mode faster-whisper performans/model boyutu ölçümleri
 ├── design_guidelines.json Tasarım sistemi (Swiss/High-Contrast, Klein blue accent)
 ├── test_fixtures/         Örnek ses dosyaları
 ├── .emergent/             Emergent platformuna özel dosyalar (artık bağımlılık yok, referans)
@@ -89,9 +90,11 @@ format/boyut doğrula, transcode/chunk, Whisper'a gönder, birleştir →
 konuşmacı ayrımı yaptır (hata durumunda sessizce None dönüyor).
 
 İş akışı (`TRANSCRIPTION_BACKEND=local`): aynı format/boyut doğrulaması →
-`_transcribe_local()` (faster-whisper, `vad_filter=True` + `cpu_threads=
-os.cpu_count()`, segment+timestamp'li) → `diarized_text` her zaman `null`
-döner. **Diarization (`_diarize_local()` + `_align_and_format_diarization()`)
+`_transcribe_local()` (faster-whisper `BatchedInferencePipeline`,
+`vad_filter=True` + `batch_size=WHISPER_BATCH_SIZE` + `cpu_threads=
+_local_cpu_threads()` — `os.sched_getaffinity(0)` tabanlı, cgroup/container-
+farkında —, segment+timestamp'li; bkz. `BENCHMARK.md`) → `diarized_text` her
+zaman `null` döner. **Diarization (`_diarize_local()` + `_align_and_format_diarization()`)
 şu an devre dışı** — hedef VPS'te (GPU yok) pyannote'un CPU maliyeti kabul
 edilemez bulundu; kod silinmedi, `transcribe_audio()` içinde çağrı yorum
 satırına alındı (bkz. kod yorumu ve README.md "Local mode ile çalıştırma"
@@ -181,6 +184,24 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
   ilgili yorum satırındaki bloğun yorumunu kaldırın — kod ve testler
   (`test_diarize_local_calls_pyannote_with_token`) hâlâ mevcut ve çalışıyor.
   API mode (Claude ile diarization) hiç etkilenmedi.
+- **Local mode performans optimizasyonu + model boyutu benchmark'ı
+  (2026-07-28):** `_transcribe_local()` artık faster-whisper'ın
+  `BatchedInferencePipeline`'ını kullanıyor (VAD segmentlerini toplu işler)
+  — 4 çekirdekli bir VPS simülasyonunda (`taskset -c 0-3`) 7-8.5x hızlanma
+  ölçüldü. Ayrıca gerçek bir bug bulunup düzeltildi: `cpu_threads=
+  os.cpu_count()` host'un toplam çekirdek sayısını döndürüyor, cgroup/
+  container/VPS CPU kısıtlamasını görmüyor — bu, gerçek limitten fazla
+  thread açılmasına (oversubscription, "~117% CPU" belirtisiyle uyumlu) ve
+  daha kötü performansa yol açıyordu; `_local_cpu_threads()`
+  (`os.sched_getaffinity(0)`, cgroup/taskset-farkında) ile düzeltildi.
+  `WHISPER_BATCH_SIZE` env değişkeni eklendi (varsayılan 8). Tam ölçüm
+  metodolojisi, sayılar ve tiny/base/small model karşılaştırması:
+  **`BENCHMARK.md`**. `WHISPER_MODEL_SIZE` bilinçli olarak env değişkeni
+  olarak bırakıldı (kod içinde sabitlenmedi) — bu benchmark'ın temiz/tek
+  konuşmacılı test verisinde model boyutunun kelime doğruluğuna ölçülebilir
+  bir etkisi bulunamadı (gerçek hedef kullanım senaryosu — gürültülü/düşük
+  kaliteli kayıt — için ayrıca test edilmesi öneriliyor, bkz. BENCHMARK.md
+  "Değerlendirme").
 
 ## Sabit Kurallar (Claude Code her zaman uymalı)
 
@@ -208,6 +229,8 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
 - `SECURITY_NOTES.md` — auth/rate-limit risk değerlendirmesi + implementasyon
   detayı (API-key, slowapi, in-memory storage kısıtı).
 - `README.md` — kurulum (lokal + Docker), test çalıştırma, API endpoint tablosu.
+- `BENCHMARK.md` — local mode faster-whisper performans ölçümleri (batching,
+  cpu_threads düzeltmesi) ve tiny/base/small model karşılaştırması.
 - `design_guidelines.json` — tasarım sistemi tanımı.
 
 ## Çalışma Yöntemi

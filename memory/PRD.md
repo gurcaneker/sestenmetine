@@ -238,3 +238,48 @@ Sıralama: security → cleanup → consistency → test → infra → docs (CLA
   xdist worker'da `backend_test.py`'nin `load_dotenv` çağrısından sızıp
   testi non-deterministik kırıyordu — artık `WHISPER_MODEL_SIZE` testte
   açıkça `delenv` ediliyor. Tam paket: 20 test geçti, 4 skip, 0 hata.
+
+**2026-07-28 — local mode performans optimizasyonu + model boyutu benchmark'ı**
+- `_transcribe_local()` artık ham `WhisperModel.transcribe()` yerine
+  faster-whisper'ın `BatchedInferencePipeline`'ını kullanıyor (yeni
+  `_get_local_whisper_pipeline()`) — VAD ile bulunan konuşma segmentlerini
+  tek tek değil toplu işliyor. 4 çekirdekli bir VPS simülasyonunda
+  (`taskset -c 0-3`) ~115s'lik çok-segmentli bir kayıtta ölçülen hızlanma:
+  tiny 7.2x (14.94s→2.09s), base 8.5x (32.93s→3.87s), small 7.3x
+  (81.02s→11.08s). Yeni `WHISPER_BATCH_SIZE` env değişkeni eklendi
+  (varsayılan `8` — 4/8/16 karşılaştırıldı, bu test setinde anlamlı fark
+  yoktu, 8 daha uzun/çok-segmentli gerçek kayıtlar için güvenli bir orta yol).
+- **Gerçek bir performans bug'ı bulunup düzeltildi:** kod `cpu_threads=
+  os.cpu_count()` kullanıyordu — `os.cpu_count()` host makinenin toplam
+  çekirdek sayısını döner, cgroup/container/VPS CPU kısıtlamasını GÖRMEZ.
+  Bu, bir VPS/container'da gerçek payından fazla thread açılmasına
+  (oversubscription) yol açıyordu — kullanıcının gözlemlediği "~117% CPU"
+  (4 çekirdekli sistemde ~1 çekirdek civarı) belirtisiyle uyumlu bir kök
+  neden. Doğrulama: `taskset -c 0-3` ile 4 çekirdeğe kısıtlı ortamda,
+  `cpu_threads=16` (host'un gerçek çekirdek sayısı, `os.cpu_count()`'un
+  döneceği değer) `cpu_threads=4`'e (doğru, kısıtlı değer) göre ~%34 daha
+  yavaştı ve daha düşük çekirdek kullanım verimliliği gösterdi (2.86 vs 3.65
+  "kullanılan çekirdek" — cpu_time/wall_time). Düzeltme: yeni
+  `_local_cpu_threads()` fonksiyonu `os.sched_getaffinity(0)` kullanıyor
+  (Linux'a özgü, cgroup/`taskset`-farkında; yoksa `os.cpu_count()`'a düşer).
+- **Model boyutu (tiny/base/small) karşılaştırması** (batching aktif,
+  `cpu_threads=4`, `batch_size=8`): temiz, tek-segmentli gerçek bir kayıtta
+  (`jfk.flac`, ~11s) üç model de **kelime düzeyinde aynı** transkripti
+  üretti — tek fark noktalama (tiny bir virgülü atladı). Süre farkı belirgin:
+  tiny 0.51s, base 0.83s, small 2.21s (small, tiny'den ~4.3x yavaş). Uzun/
+  çok-segmentli sentetik bir kayıtta (aynı cümle 9 kez tekrar) üçü de
+  kelimeleri doğru transkribe etti ama tekrar arttıkça noktalama tutarlılığı
+  düşüyor — `small` en uzun süre (~5 tekrar) noktalamayı koruyor, `base` ~3
+  tekrar, `tiny` hiç tutturamadı. **Sonuç:** bu (temiz, tek konuşmacılı)
+  test setinde model boyutunun kelime doğruluğuna ölçülebilir bir etkisi
+  yok; asıl hedef kullanım senaryosu (gürültülü/düşük kaliteli kayıt) için
+  ayrı test önerildi. `WHISPER_MODEL_SIZE` **değiştirilmedi** — env
+  değişkeni olarak kalıyor (varsayılan `small`), kod içinde sabitlenmedi.
+  Tam metodoloji, ölçüm scripti ve tablolar: `BENCHMARK.md` (yeni dosya).
+- Test: `test_transcribe_local_calls_faster_whisper_and_shapes_output`
+  artık `BatchedInferencePipeline` çağrısını (model, batch_size, vad_filter)
+  doğruluyor; yeni `test_local_cpu_threads_uses_sched_affinity_not_cpu_count`
+  regresyon testi eklendi (`os.sched_getaffinity`/`os.cpu_count()` mock'lanıp
+  doğru değerin seçildiği doğrulanıyor). Tam paket: 21 test geçti, 4 skip,
+  0 hata; canlı sunucuya karşı gerçek bir `/api/transcribe` isteğiyle de
+  (local mode, `WHISPER_MODEL_SIZE=tiny`) uçtan uca doğrulandı.

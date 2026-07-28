@@ -48,6 +48,13 @@ if TRANSCRIPTION_BACKEND not in ('api', 'local'):
     )
 
 WHISPER_MODEL_SIZE = os.environ.get('WHISPER_MODEL_SIZE', 'small')
+# Batch size for faster-whisper's BatchedInferencePipeline (batches the
+# VAD-detected speech segments together instead of transcribing them one at a
+# time — see _get_local_whisper_pipeline). Benchmarked on a ~2min multi-segment
+# clip: 4/8/16 performed within noise of each other (this fixture only had ~9
+# segments), 8 is a safe default that also has headroom for longer/busier
+# real-world recordings without ballooning memory. See BENCHMARK.md.
+WHISPER_BATCH_SIZE = int(os.environ.get('WHISPER_BATCH_SIZE', '8'))
 
 HF_TOKEN = os.environ.get('HF_TOKEN')
 if TRANSCRIPTION_BACKEND == 'local' and not HF_TOKEN:
@@ -242,7 +249,27 @@ async def _diarize_with_claude(raw_text: str, api_key: str) -> Optional[str]:
 # loaded once and cached in these module-level globals (loading a Whisper/
 # pyannote model takes real time — must not happen per-request).
 _local_whisper_model = None
+_local_whisper_pipeline = None
 _local_diarization_pipeline = None
+
+
+def _local_cpu_threads() -> int:
+    """Number of CPU threads ctranslate2 should actually use.
+
+    Deliberately NOT os.cpu_count(): that returns the host machine's total
+    core count and ignores cgroup/container CPU limits (Docker --cpus,
+    a VPS's cpuset, taskset, ...). On a 4-vCPU container running on a bigger
+    host, os.cpu_count() over-reports, so cpu_threads=os.cpu_count() spins up
+    more OpenMP threads than are actually schedulable — verified this
+    directly causes worse wall-clock time (thread oversubscription/contention)
+    than passing the real, affinity-limited count. os.sched_getaffinity(0) is
+    the standard cgroup/taskset-aware way to get the usable core count on
+    Linux. See BENCHMARK.md for the measurement.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 4  # sched_getaffinity is Linux-only
 
 
 def _get_local_whisper_model():
@@ -262,9 +289,28 @@ def _get_local_whisper_model():
         )
         _local_whisper_model = WhisperModel(
             WHISPER_MODEL_SIZE, device="cpu", compute_type="int8",
-            cpu_threads=os.cpu_count() or 4,  # use all available cores
+            cpu_threads=_local_cpu_threads(),
         )
     return _local_whisper_model
+
+
+def _get_local_whisper_pipeline():
+    """Lazily wrap the faster-whisper model in a BatchedInferencePipeline
+    (cached alongside the model — same lifetime, same underlying weights).
+
+    Batching groups the VAD-detected speech segments together instead of
+    running the encoder/decoder once per segment sequentially — on a ~2min
+    multi-segment benchmark clip this cut wall-clock time by ~7-8x on a
+    4-core box (81s → 11s for the 'small' model) because a single segment's
+    decode loop doesn't parallelize across cores well, while a batch of
+    segments does. See BENCHMARK.md.
+    """
+    global _local_whisper_pipeline
+    if _local_whisper_pipeline is None:
+        from faster_whisper import BatchedInferencePipeline  # lazy: see module note above
+
+        _local_whisper_pipeline = BatchedInferencePipeline(model=_get_local_whisper_model())
+    return _local_whisper_pipeline
 
 
 def _get_local_diarization_pipeline():
@@ -295,16 +341,18 @@ def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str]):
     _align_and_format_diarization(). Same role as the API backend's raw_text,
     just with segment timing attached.
     """
-    model = _get_local_whisper_model()
+    pipeline = _get_local_whisper_pipeline()
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
         tmp.write(raw_bytes)
         tmp_path = tmp.name
     try:
-        segments_iter, _info = model.transcribe(
+        segments_iter, _info = pipeline.transcribe(
             tmp_path,
             language=lang_code,
-            vad_filter=True,  # skip silence — faster, and avoids hallucinated
-            # text on silent stretches (never changes accuracy on real speech)
+            vad_filter=True,  # required by BatchedInferencePipeline — also
+            # skips silence, avoiding hallucinated text on silent stretches
+            # (never changes accuracy on real speech).
+            batch_size=WHISPER_BATCH_SIZE,
             # beam_size intentionally left at faster-whisper's default: this
             # is an accuracy/speed trade-off and accuracy is prioritized here.
         )

@@ -149,22 +149,38 @@ class TestLocalPipelineMocked:
 
         fake_segment = MagicMock(start=0.0, end=1.5, text=" Merhaba dünya ")
         fake_model = MagicMock()
-        fake_model.transcribe.return_value = ([fake_segment], MagicMock())
+        fake_pipeline_instance = MagicMock()
+        fake_pipeline_instance.transcribe.return_value = ([fake_segment], MagicMock())
         fake_module = types.ModuleType("faster_whisper")
         fake_module.WhisperModel = MagicMock(return_value=fake_model)
+        fake_module.BatchedInferencePipeline = MagicMock(return_value=fake_pipeline_instance)
 
         with patch.dict(sys.modules, {"faster_whisper": fake_module}):
             raw_text, segments = server._transcribe_local(b"fake audio bytes", "wav", "tr")
 
         fake_module.WhisperModel.assert_called_once_with(
             server.WHISPER_MODEL_SIZE, device="cpu", compute_type="int8",
-            cpu_threads=os.cpu_count() or 4,
+            cpu_threads=server._local_cpu_threads(),
         )
-        fake_model.transcribe.assert_called_once()
-        assert fake_model.transcribe.call_args.kwargs.get("language") == "tr"
-        assert fake_model.transcribe.call_args.kwargs.get("vad_filter") is True
+        fake_module.BatchedInferencePipeline.assert_called_once_with(model=fake_model)
+        fake_pipeline_instance.transcribe.assert_called_once()
+        call_kwargs = fake_pipeline_instance.transcribe.call_args.kwargs
+        assert call_kwargs.get("language") == "tr"
+        assert call_kwargs.get("vad_filter") is True
+        assert call_kwargs.get("batch_size") == server.WHISPER_BATCH_SIZE
         assert raw_text == "Merhaba dünya"
         assert segments == [{"start": 0.0, "end": 1.5, "text": "Merhaba dünya"}]
+
+    def test_local_cpu_threads_uses_sched_affinity_not_cpu_count(self, monkeypatch):
+        """Regression test for the oversubscription bug: os.cpu_count() reports
+        the host's total cores and ignores cgroup/container/taskset limits,
+        which caused worse wall-clock time on a CPU-limited VPS (measured in
+        BENCHMARK.md) than the real, affinity-aware thread count."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        monkeypatch.setattr(server.os, "sched_getaffinity", lambda pid: set(range(4)), raising=False)
+        monkeypatch.setattr(server.os, "cpu_count", lambda: 64)
+        assert server._local_cpu_threads() == 4
 
     def test_diarize_local_calls_pyannote_with_token(self, monkeypatch):
         _fake_local_mode_env(monkeypatch)

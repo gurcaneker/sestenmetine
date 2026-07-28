@@ -138,14 +138,19 @@ cd backend
 #   TRANSCRIPTION_BACKEND=local
 #   HF_TOKEN=hf_...              (1. adımdaki token)
 #   WHISPER_MODEL_SIZE=small     (opsiyonel — tiny/base/small/medium/large-v3)
+#   WHISPER_BATCH_SIZE=8         (opsiyonel — bkz. BENCHMARK.md)
 .venv/bin/pip install -r requirements.txt --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/
 .venv/bin/uvicorn server:app --reload
 ```
 İlk `/api/transcribe` isteğinde faster-whisper modeli ve pyannote pipeline
 ağırlıkları `~/.cache/huggingface`'e indirilir (birkaç yüz MB — internet
 gerekir); sonraki çalıştırmalar bu cache'i kullanır, network gerekmez.
-CPU üzerinde int8 quantization ile çalışır — GPU gerekmez ama `small`/`medium`
-modelleri ile transkripsiyon API moduna göre belirgin şekilde daha yavaştır.
+CPU üzerinde int8 quantization ve batching (`BatchedInferencePipeline`) ile
+çalışır — GPU gerekmez ama `small`/`medium` modelleri ile transkripsiyon API
+moduna göre belirgin şekilde daha yavaştır. Hangi `WHISPER_MODEL_SIZE`'ın
+sizin donanımınız/ses kaliteniz için doğru olduğuna karar vermeden önce
+**`BENCHMARK.md`**'ye bakın — 4 çekirdekli bir ortamda ölçülen hız/model
+boyutu karşılaştırması orada.
 
 Yukarıdaki HF_TOKEN adımları diarization şu an kapalıyken de geçerli:
 `TRANSCRIPTION_BACKEND=local` fail-fast mantığı hâlâ `HF_TOKEN` bekliyor
