@@ -138,6 +138,132 @@ class TestAlignAndFormatDiarization:
         ) is None
 
 
+class TestFormatTranscriptWithPauses:
+    """Pure Python logic (gap-based line breaking) — no ML models involved,
+    tested for real rather than mocked. This is readability-only formatting,
+    NOT diarization: no speaker labels are ever added here (contrast with
+    TestAlignAndFormatDiarization above)."""
+
+    def test_empty_segments_returns_empty_string(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        assert server._format_transcript_with_pauses([]) == ""
+
+    def test_single_segment_no_line_break(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        segments = [{"start": 0.0, "end": 1.0, "text": "Merhaba dünya"}]
+        assert server._format_transcript_with_pauses(segments) == "Merhaba dünya"
+
+    def test_small_gap_stays_on_same_line(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        # 0.3s gap, well under PAUSE_THRESHOLD_SECONDS (1.3s) — normal
+        # within-sentence breathing pause, must NOT split.
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Merhaba,"},
+            {"start": 1.3, "end": 2.0, "text": "nasılsın?"},
+        ]
+        assert server._format_transcript_with_pauses(segments) == "Merhaba, nasılsın?"
+
+    def test_large_gap_breaks_into_new_line(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        # 2.0s gap, well over PAUSE_THRESHOLD_SECONDS (1.3s) — must split.
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "İlk cümle."},
+            {"start": 3.0, "end": 4.0, "text": "İkinci cümle."},
+        ]
+        assert server._format_transcript_with_pauses(segments) == "İlk cümle.\nİkinci cümle."
+
+    def test_gap_exactly_at_threshold_does_not_split(self, monkeypatch):
+        """Boundary check: the comparison is strictly-greater-than, so a gap
+        exactly equal to the threshold stays on the same line."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "a"},
+            {"start": 1.0 + server.PAUSE_THRESHOLD_SECONDS, "end": 3.0, "text": "b"},
+        ]
+        assert server._format_transcript_with_pauses(segments) == "a b"
+
+    def test_multiple_pauses_produce_multiple_lines(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Birinci."},
+            {"start": 1.2, "end": 2.0, "text": "hâlâ birinci satırda."},
+            {"start": 5.0, "end": 6.0, "text": "İkinci satır."},
+            {"start": 10.0, "end": 11.0, "text": "Üçüncü satır."},
+        ]
+        result = server._format_transcript_with_pauses(segments)
+        assert result == (
+            "Birinci. hâlâ birinci satırda.\n"
+            "İkinci satır.\n"
+            "Üçüncü satır."
+        )
+
+    def test_no_speaker_labels_added(self, monkeypatch):
+        """Explicit regression guard for the task's core requirement: this
+        function must never add "1. kişi"-style labels — contrast with
+        _align_and_format_diarization, which is a separate, currently-
+        disabled feature."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Merhaba."},
+            {"start": 5.0, "end": 6.0, "text": "Nasılsın?"},
+        ]
+        result = server._format_transcript_with_pauses(segments)
+        assert "kişi" not in result.lower()
+        assert result == "Merhaba.\nNasılsın?"
+
+
+class TestNormalizeOpenAISegments:
+    """_normalize_openai_segments is used by api mode (TRANSCRIPTION_BACKEND
+    default) to turn OpenAI Whisper's verbose_json segments into the same
+    {"start", "end", "text"} shape _format_transcript_with_pauses expects —
+    tested here (not api-mode-specific) since it's pure logic, no network."""
+
+    def test_normalizes_dict_segments(self, monkeypatch):
+        monkeypatch.setenv("API_KEY", "test-key")
+        server = _reload_server()
+        raw = [
+            {"start": 0.0, "end": 1.0, "text": " Merhaba "},
+            {"start": 1.0, "end": 2.0, "text": "dünya"},
+        ]
+        assert server._normalize_openai_segments(raw) == [
+            {"start": 0.0, "end": 1.0, "text": "Merhaba"},
+            {"start": 1.0, "end": 2.0, "text": "dünya"},
+        ]
+
+    def test_normalizes_object_segments(self, monkeypatch):
+        """litellm/emergent-proxy responses may hand back segment objects
+        instead of plain dicts."""
+        monkeypatch.setenv("API_KEY", "test-key")
+        server = _reload_server()
+        raw = [MagicMock(start=0.0, end=1.0, text="Merhaba")]
+        assert server._normalize_openai_segments(raw) == [
+            {"start": 0.0, "end": 1.0, "text": "Merhaba"},
+        ]
+
+    def test_skips_empty_text_segments(self, monkeypatch):
+        monkeypatch.setenv("API_KEY", "test-key")
+        server = _reload_server()
+        raw = [
+            {"start": 0.0, "end": 1.0, "text": "  "},
+            {"start": 1.0, "end": 2.0, "text": "gerçek metin"},
+        ]
+        assert server._normalize_openai_segments(raw) == [
+            {"start": 1.0, "end": 2.0, "text": "gerçek metin"},
+        ]
+
+    def test_none_input_returns_empty_list(self, monkeypatch):
+        monkeypatch.setenv("API_KEY", "test-key")
+        server = _reload_server()
+        assert server._normalize_openai_segments(None) == []
+
+
 class TestLocalPipelineMocked:
     """faster-whisper / pyannote.audio injected via sys.modules — these
     tests never touch the real packages or download anything, and pass
@@ -170,6 +296,26 @@ class TestLocalPipelineMocked:
         assert call_kwargs.get("batch_size") == server.WHISPER_BATCH_SIZE
         assert raw_text == "Merhaba dünya"
         assert segments == [{"start": 0.0, "end": 1.5, "text": "Merhaba dünya"}]
+
+    def test_transcribe_local_breaks_lines_on_long_pauses(self, monkeypatch):
+        """Integration check that _transcribe_local actually wires its
+        segments through _format_transcript_with_pauses (the unit logic
+        itself is covered in TestFormatTranscriptWithPauses)."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        seg1 = MagicMock(start=0.0, end=1.0, text="İlk cümle.")
+        seg2 = MagicMock(start=5.0, end=6.0, text="İkinci cümle.")  # 4s gap > threshold
+        fake_pipeline_instance = MagicMock()
+        fake_pipeline_instance.transcribe.return_value = ([seg1, seg2], MagicMock())
+        fake_module = types.ModuleType("faster_whisper")
+        fake_module.WhisperModel = MagicMock(return_value=MagicMock())
+        fake_module.BatchedInferencePipeline = MagicMock(return_value=fake_pipeline_instance)
+
+        with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+            raw_text, _segments = server._transcribe_local(b"fake audio bytes", "wav", "tr", "standard")
+
+        assert raw_text == "İlk cümle.\nİkinci cümle."
 
     def test_local_cpu_threads_uses_sched_affinity_not_cpu_count(self, monkeypatch):
         """Regression test for the oversubscription bug: os.cpu_count() reports

@@ -409,3 +409,54 @@ Sıralama: security → cleanup → consistency → test → infra → docs (CLA
   değişikliği olduğu için backend_test.py + test_local_mode.py +
   test_media_validation.py hepsi çalıştırıldı).
 - Detay ve tam gerekçe: `BENCHMARK.md` "Bulgu 5".
+
+**2026-07-28 — duraklama-tabanlı satır kırma (okunabilirlik, diarization DEĞİL)**
+- `text` alanı artık düz tek paragraf değil: iki konuşma birimi arasındaki
+  boşluk `PAUSE_THRESHOLD_SECONDS`'ı (1.3s, kod içinde sabit — env değil,
+  bilinçli olarak) aştığında `\n` ile satırlara bölünüyor. Yeni
+  `_format_transcript_with_pauses()` fonksiyonu hem `_transcribe_local`
+  (local mode) hem `transcribe_audio`'nun api-mode dalında kullanılıyor.
+  **Konuşmacı etiketi ("1. kişi" vb.) EKLENMEDİ** — bu kasıtlı olarak sadece
+  okunabilirlik amaçlı satır kırma, `diarized_text` alanına hiç dokunulmadı
+  (görev tanımının açık kısıtı).
+- **Gerçek, testte bulunan bir tasarım sorunu ve düzeltmesi:** İlk tasarım
+  Whisper'ın kendi ürettiği segment (cümle/ifade seviyesi) sınırlarını
+  kullanıyordu — ama gerçek bir sentetik test klibiyle (JFK konuşması + 3
+  saniyelik sessizlik + tekrar) doğrudan test edildiğinde,
+  `BatchedInferencePipeline`'ın (local mode'un performans için kullandığı,
+  bkz. BENCHMARK.md Bulgu 2) VAD ile ayırdığı iki konuşma bloğunu TEK bir
+  kaba `Segment`'te birleştirdiği görüldü — 3 saniyelik boşluk segment
+  sınırlarında hiç görünmedi, tüm 25 saniyelik klip tek segment olarak
+  döndü. Çözüm: `word_timestamps=True` ile **kelime seviyesi** zaman
+  damgaları kullanıldı (segment değil) — aynı test klibinde kelimeler
+  arasındaki 3.36s'lik boşluk doğru tespit edildi (`_transcribe_local`
+  artık hem eski segment-seviyesi `whisper_segments`'i — değişmeden,
+  diarization alignment için — hem ayrı bir kelime listesini döndürüyor,
+  ikincisi sadece satır kırma için kullanılıyor).
+- API mode'da da tutarlılık için aynı kelime-seviyesi yaklaşım kullanıldı:
+  `response_format=verbose_json` + `timestamp_granularities=["word"]`
+  (önceden `response_format=json`, hiç zaman damgası yoktu). OpenAI'nin
+  gerçek API'sinde local mode'daki aynı "segment birleştirme" sorununun
+  olup olmadığı bu dev ortamında test edilemedi (`EMERGENT_LLM_KEY` yok) —
+  varsayımda bulunmak yerine iki modda da aynı, gerçekten test edilmiş
+  granülarite (kelime) kullanılması tercih edildi. Sağlam bir soft-fail
+  zinciri var: kelime zaman damgaları yoksa segment'lere, o da yoksa düz
+  `response.text`'e düşer.
+- `PAUSE_THRESHOLD_SECONDS = 1.3` saniye seçildi (normal cümle-içi nefes
+  duraklamaları genelde <1s, kasıtlı cümleler/konu arası duraklamalar
+  genelde 1.5s+ — bu projenin hedef içeriği olan röportaj/toplantı
+  kayıtlarında). Ölçülmüş bir değer değil, gerekçeli bir varsayılan —
+  gerekirse `backend/server.py`'de değiştirilebilir (env değişkeni değil,
+  görev tanımı gereği).
+- Gerçek sunucu üzerinden hem sentetik duraklamalı (3s sessizlik → satır
+  kırıldı, doğrulandı) hem gerçek doğal konuşmayla (jfk.wav, kısa/duraksız
+  → tek satır kaldı, gereksiz bölünme yok) doğrulandı.
+- Frontend (`Transcriber.jsx`): Kod değişikliği gerekmedi — metin zaten
+  `white-space: pre-wrap` CSS class'ıyla render ediliyordu (önceden
+  diarized_text'in çok satırlı "1. kişi:\n2. kişi:" formatı için eklenmişti),
+  bu da `\n` karakterlerini otomatik satır sonu olarak gösteriyor. Doğrulandı.
+- Test: `test_local_mode.py`'ye `TestFormatTranscriptWithPauses` (saf mantık,
+  boşluk eşiği sınır durumu dahil, 7 test), `TestNormalizeOpenAISegments`
+  (api-mode segment/kelime normalizasyonu, 4 test) ve `_transcribe_local`'ın
+  gerçekten pause-formatting'e sarıldığını doğrulayan bir entegrasyon testi
+  eklendi. Tam paket: 49 test geçti, 4 skip, 0 hata.

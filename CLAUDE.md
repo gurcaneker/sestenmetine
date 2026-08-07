@@ -87,16 +87,19 @@ sestenmetine/
 format/boyut doğrula → `_verify_media_stream()` (uzantıdan bağımsız, gerçek
 içerik kontrolü — hem api hem local mode'da çalışır, bkz. aşağıdaki "Format
 genişletme" notu) → `_prepare_chunks()` (mono/16kHz downsample, ≤20MB
-parçalara böl) → Whisper'a gönder, birleştir → `_diarize_with_claude()` →
-Whisper çıktısını claude-sonnet-4-6'ya gönderip konuşmacı ayrımı yaptır (hata
-durumunda sessizce None dönüyor).
+parçalara böl) → Whisper'a `response_format=verbose_json` +
+`timestamp_granularities=["word"]` ile gönder (kelime zaman damgaları —
+neden segment değil kelime seviyesi için bkz. aşağıdaki "Duraklama-tabanlı
+satır kırma" notu), `_format_transcript_with_pauses()` ile satırlara böl,
+birleştir → `_diarize_with_claude()` → Whisper çıktısını claude-sonnet-4-6'ya
+gönderip konuşmacı ayrımı yaptır (hata durumunda sessizce None dönüyor).
 
 İş akışı (`TRANSCRIPTION_BACKEND=local`): aynı format/boyut doğrulaması →
 `_transcribe_local()` (faster-whisper `BatchedInferencePipeline`,
 `vad_filter=True` + `batch_size=WHISPER_BATCH_SIZE` + `cpu_threads=
 _local_cpu_threads()` — `os.sched_getaffinity(0)` tabanlı, cgroup/container-
-farkında —, segment+timestamp'li; bkz. `BENCHMARK.md`) → `diarized_text` her
-zaman `null` döner. **Diarization (`_diarize_local()` + `_align_and_format_diarization()`)
+farkında — + `word_timestamps=True`, segment+kelime+timestamp'li; bkz.
+`BENCHMARK.md`) → `diarized_text` her zaman `null` döner. **Diarization (`_diarize_local()` + `_align_and_format_diarization()`)
 şu an devre dışı** — hedef VPS'te (GPU yok) pyannote'un CPU maliyeti kabul
 edilemez bulundu; kod silinmedi, `transcribe_audio()` içinde çağrı yorum
 satırına alındı (bkz. kod yorumu ve README.md "Local mode ile çalıştırma"
@@ -267,6 +270,33 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
   boyutu çözümlemesi, cache'in mod başına ayrı tutulduğu, bir modun
   diğerini asla yüklemediği, endpoint'in `quality_mode`'u doğru forward
   ettiği ve geçersiz değeri reddettiği, hepsi mock'lu (gerçek model indirmeden).
+- **Duraklama-tabanlı satır kırma eklendi (2026-07-28):** `text` alanı artık
+  düz tek paragraf değil — iki konuşma birimi arasındaki boşluk
+  `PAUSE_THRESHOLD_SECONDS`'ı (1.3s, kod içinde sabit, env değil) aştığında
+  `\n` ile satırlara bölünüyor. Bu **diarization DEĞİL** — konuşmacı etiketi
+  ("1. kişi" vb.) eklenmiyor, sadece okunabilirlik için satır kırma;
+  `diarized_text` alanına hiç dokunulmadı. Yeni `_format_transcript_with_
+  pauses()` fonksiyonu hem local hem api mode'da kullanılıyor.
+  **Gerçek, test sırasında bulunan bir sorun:** ilk tasarım Whisper'ın kendi
+  segment (cümle/ifade seviyesi) sınırlarını kullanıyordu, ama gerçek testte
+  `BatchedInferencePipeline`'ın VAD ile ayırdığı konuşma bloklarını tek bir
+  kaba `Segment`'te birleştirebildiği görüldü — sentetik 3 saniyelik bir
+  sessizlik içeren bir klipte TÜM klip tek bir segment olarak döndü, boşluk
+  segment sınırlarında hiç görünmedi. Çözüm: `word_timestamps=True` ile
+  **kelime seviyesi** zaman damgaları kullanılıyor (segment değil) — aynı
+  test klibinde kelimeler arasındaki 3s+ boşluk doğru şekilde tespit edildi.
+  API mode'da da tutarlılık için aynı yaklaşım kullanıldı
+  (`timestamp_granularities=["word"]`, `response_format=verbose_json`) —
+  OpenAI'nin gerçek API'sinde aynı sorunun olup olmadığı bu dev ortamında
+  test edilemedi (`EMERGENT_LLM_KEY` yok), bu yüzden varsayımda bulunmak
+  yerine iki modda da aynı, test edilmiş granülariteyi kullanmak tercih
+  edildi. `whisper_segments` (diarization alignment için kullanılan, şu an
+  devre dışı) değişmedi — hâlâ segment seviyesinde, ayrı tutuldu. Gerçek
+  sunucu üzerinden hem duraklamalı hem duraklamasız gerçek ses dosyalarıyla
+  doğrulandı. Test: `test_local_mode.py`'ye `TestFormatTranscriptWithPauses`
+  (saf mantık, 7 test) + `TestNormalizeOpenAISegments` (4 test) + bir
+  entegrasyon testi eklendi. Tam paket: 49 test geçti, 4 skip, 0 hata.
+  Detay: README.md.
 
 ## Sabit Kurallar (Claude Code her zaman uymalı)
 

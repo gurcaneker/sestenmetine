@@ -167,6 +167,17 @@ Hızlı. İki model de aynı anda belleğe yüklenmez — her biri sadece fiilen
 talep edildiğinde yüklenip cache'lenir, aynı moddaki sonraki istekler
 yeniden yükleme maliyeti ödemez.
 
+**Okunabilirlik için duraklama-tabanlı satır kırma:** `text` alanı düz tek
+paragraf değil — konuşmadaki doğal duraklamalarda (art arda iki konuşma
+biriminin arasındaki boşluk 1.3 saniyeyi aştığında) otomatik olarak `\n` ile
+satırlara bölünür (`_format_transcript_with_pauses()`, hem local hem api
+mode'da). **Bu diarization (konuşmacı ayrımı) DEĞİLDİR** — "1. kişi" gibi
+etiketler eklenmez, sadece okunabilirlik amaçlı satır kırma; `diarized_text`
+alanı bundan etkilenmez. Frontend zaten `white-space: pre-wrap` ile bu satır
+sonlarını doğru gösteriyor. Eşik değeri (`PAUSE_THRESHOLD_SECONDS`) kod
+içinde sabit, env değişkeni değil — değiştirmek isterseniz `backend/server.py`
+içinde düzenleyin.
+
 Diarization yeniden açıldığında geçerli olacak davranış (kod hazır, aşağıdaki
 gibi uçtan uca doğrulandı): pipeline yüklenemez/başarısız olursa istek
 **başarısız olmaz** — `_diarize_with_claude`'un API-mode'daki davranışıyla

@@ -143,6 +143,20 @@ VIDEO_EXTS = {
 # of the generic one. See CLAUDE.md "Bilinen Kritik Sorunlar".
 DVR_EXTS = {"dav"}
 
+# Readability-only line breaking for the `text` field (NOT diarization/speaker
+# labeling — see _format_transcript_with_pauses below and
+# _align_and_format_diarization for the separate, currently-disabled speaker
+# feature). A gap between two Whisper segments longer than this is treated as
+# a natural pause worth a line break. Picked as a reasoned middle ground, not
+# a benchmarked value (no annotated pause dataset available): normal
+# within-sentence breathing pauses in spoken audio are usually well under 1s,
+# while a deliberate pause between sentences/thoughts (interview answers,
+# topic changes — this app's target content) tends to run 1.5s+. 1.3s sits
+# between the two so it doesn't fragment mid-sentence but still catches real
+# breaks. Adjust here (not via env — see CLAUDE.md/README.md) if it over- or
+# under-splits on your audio.
+PAUSE_THRESHOLD_SECONDS = 1.3
+
 ALLOWED_EXTS = WHISPER_NATIVE_EXTS | EXTRA_AUDIO_EXTS | VIDEO_EXTS | DVR_EXTS
 
 # Whisper (whisper-1) supports natively: mp3, mp4, mpeg, mpga, m4a, wav, webm.
@@ -156,6 +170,48 @@ def _get_ext(filename: str) -> str:
     if not filename or '.' not in filename:
         return ''
     return filename.rsplit('.', 1)[-1].lower()
+
+
+def _format_transcript_with_pauses(segments: List[dict]) -> str:
+    """Join segment texts, inserting a newline wherever the gap between two
+    consecutive segments exceeds PAUSE_THRESHOLD_SECONDS.
+
+    Readability-only line breaking — NOT diarization. No speaker labels
+    ("1. kişi" etc.) are added here; that's a separate, currently-disabled
+    feature (_align_and_format_diarization). `segments` is a chronological
+    list of {"start": float, "end": float, "text": str} dicts — the same
+    shape _transcribe_local's whisper_segments already uses.
+    """
+    if not segments:
+        return ""
+
+    lines: List[str] = []
+    current_parts: List[str] = [segments[0]["text"]]
+    for prev_seg, seg in zip(segments, segments[1:]):
+        gap = seg["start"] - prev_seg["end"]
+        if gap > PAUSE_THRESHOLD_SECONDS:
+            lines.append(" ".join(current_parts).strip())
+            current_parts = [seg["text"]]
+        else:
+            current_parts.append(seg["text"])
+    lines.append(" ".join(current_parts).strip())
+
+    return "\n".join(line for line in lines if line)
+
+
+def _normalize_openai_segments(raw_items, text_key: str = "text") -> List[dict]:
+    """Normalize OpenAI Whisper API `verbose_json` segments or words (a list
+    of dicts, or pydantic-like objects depending on the litellm/emergent-
+    proxy response shape) into the plain {"start": float, "end": float,
+    "text": str} shape _format_transcript_with_pauses expects. Word items use
+    the key "word" instead of "text" for their text — text_key selects which."""
+    normalized: List[dict] = []
+    for item in raw_items or []:
+        get = item.get if isinstance(item, dict) else lambda k, d=None: getattr(item, k, d)
+        text = (get(text_key, "") or "").strip()
+        if text:
+            normalized.append({"start": get("start", 0.0), "end": get("end", 0.0), "text": text})
+    return normalized
 
 
 def _verify_media_stream(raw_bytes: bytes, ext: str) -> None:
@@ -432,10 +488,21 @@ def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str], qual
     _get_local_whisper_pipeline/_model_size_for_quality.
 
     Returns (raw_text, whisper_segments) where whisper_segments is a list of
-    {"start": float, "end": float, "text": str} — the per-segment timestamps
-    are needed to align with pyannote's diarization output in
-    _align_and_format_diarization(). Same role as the API backend's raw_text,
-    just with segment timing attached.
+    {"start": float, "end": float, "text": str} at Whisper's own (sentence/
+    phrase-level) segment granularity — this is what pyannote's diarization
+    output aligns against in _align_and_format_diarization(), and its shape
+    is unchanged by this function.
+
+    raw_text is NOT simply these segments joined — it's built from per-WORD
+    timestamps instead (word_timestamps=True below) purely to find natural
+    pauses (_format_transcript_with_pauses). This was a real, tested finding
+    while building the feature: with BatchedInferencePipeline,
+    VAD-separated speech chunks can get merged back into a single coarse
+    Segment spanning a multi-second silence (verified: a synthetic clip with
+    a 3s gap came back as ONE segment covering the whole clip) — so gaps
+    between Segment.start/end are NOT a reliable pause signal here. Gaps
+    between consecutive WORDS' timestamps are — they correctly exposed the
+    same 3s gap in that test. See BENCHMARK.md.
     """
     pipeline = _get_local_whisper_pipeline(quality_mode)
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
@@ -449,17 +516,22 @@ def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str], qual
             # skips silence, avoiding hallucinated text on silent stretches
             # (never changes accuracy on real speech).
             batch_size=WHISPER_BATCH_SIZE,
+            word_timestamps=True,  # see docstring above — needed for
+            # reliable pause detection, NOT used for diarization alignment.
             # beam_size intentionally left at faster-whisper's default: this
             # is an accuracy/speed trade-off and accuracy is prioritized here.
         )
         whisper_segments: List[dict] = []
-        texts: List[str] = []
+        words: List[dict] = []
         for seg in segments_iter:
             text = (seg.text or "").strip()
             if text:
                 whisper_segments.append({"start": seg.start, "end": seg.end, "text": text})
-                texts.append(text)
-        raw_text = " ".join(texts).strip()
+            for w in (seg.words or []):
+                word_text = (w.word or "").strip()
+                if word_text:
+                    words.append({"start": w.start, "end": w.end, "text": word_text})
+        raw_text = _format_transcript_with_pauses(words or whisper_segments)
         return raw_text, whisper_segments
     finally:
         try:
@@ -608,6 +680,11 @@ async def transcribe_audio(
       mode (TRANSCRIPTION_BACKEND=local): "standard" uses WHISPER_MODEL_SIZE,
       "precise" always uses large-v3-turbo (~3x slower, more accurate on some
       harder/noisier audio — see BENCHMARK.md "Bulgu 4"). Ignored in api mode.
+    - The `text` field is broken into lines at natural pauses (gaps between
+      Whisper segments longer than PAUSE_THRESHOLD_SECONDS) for readability —
+      see _format_transcript_with_pauses. This is NOT diarization: no speaker
+      labels are added, only line breaks. `diarized_text` (speaker-labeled,
+      currently only produced in api mode) is unaffected by this.
     """
     if quality_mode not in QUALITY_MODES:
         raise HTTPException(
@@ -732,7 +809,21 @@ async def transcribe_audio(
             kwargs = {
                 "file": buffer,
                 "model": "whisper-1",
-                "response_format": "json",
+                # verbose_json + word-level timestamps for pause-based line
+                # breaking (_format_transcript_with_pauses). Word-level, not
+                # just segment-level: local mode's equivalent (faster-whisper
+                # BatchedInferencePipeline) was found to merge VAD-separated
+                # speech chunks back into one coarse Segment spanning a
+                # multi-second silence, hiding the pause — word timestamps
+                # didn't have that problem there (see _transcribe_local's
+                # docstring) and using the same granularity for both modes
+                # keeps this feature consistent instead of relying on
+                # assumptions about whether OpenAI's hosted API has the same
+                # issue (untestable here — no EMERGENT_LLM_KEY in this dev
+                # env). response.segments/.text remain as fallbacks below if
+                # a provider variant omits word timestamps.
+                "response_format": "verbose_json",
+                "timestamp_granularities": ["word"],
                 "temperature": 0.0,
                 "prompt": prompt,
             }
@@ -740,7 +831,15 @@ async def transcribe_audio(
                 kwargs["language"] = lang_code
 
             response = await stt.transcribe(**kwargs)
-            piece = (getattr(response, "text", None) or "").strip()
+            chunk_words = _normalize_openai_segments(getattr(response, "words", None), text_key="word")
+            if chunk_words:
+                piece = _format_transcript_with_pauses(chunk_words)
+            else:
+                chunk_segments = _normalize_openai_segments(getattr(response, "segments", None))
+                if chunk_segments:
+                    piece = _format_transcript_with_pauses(chunk_segments)
+                else:
+                    piece = (getattr(response, "text", None) or "").strip()
             if piece:
                 texts.append(piece)
     except HTTPException:
@@ -749,7 +848,10 @@ async def transcribe_audio(
         logger.exception("Transcription failed")
         raise HTTPException(status_code=500, detail=f"Transkripsiyon başarısız: {str(e)}")
 
-    raw_text = " ".join(texts).strip()
+    # Chunk boundaries are hard cuts (not real pauses), so join chunk texts
+    # with a newline too — same "\n" as within-chunk pause breaks, and a
+    # no-op when there's only one chunk (the common case).
+    raw_text = "\n".join(t for t in texts if t).strip()
     diarized_text = await _diarize_with_claude(raw_text, api_key)
 
     return {
