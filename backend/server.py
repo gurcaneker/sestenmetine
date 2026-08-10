@@ -640,6 +640,61 @@ def _align_and_format_diarization(
     return "\n".join(lines)
 
 
+def _format_speaker_timeline(
+    whisper_segments: List[dict], diar_segments: List[dict]
+) -> Optional[str]:
+    """Render pyannote's own speaker turns as a timestamped timeline:
+
+        Speaker {n}
+        {start:.2f}
+        {text}
+        {end:.2f}
+
+    repeated per turn, in chronological order, speaker numbers 0-based by
+    first-appearance order ("Speaker 0", "Speaker 1", …).
+
+    Deliberately turn-driven (one block per pyannote turn), NOT speaker-
+    label-driven like _align_and_format_diarization (which merges every
+    same-speaker run into a single block). Two separate turns from the same
+    speaker — e.g. Speaker 0 talks, pauses, Speaker 0 talks again later —
+    stay as two separate timeline blocks, because they ARE two separate
+    turns; that's what real per-turn timestamps are for. A Whisper segment
+    straddling a turn boundary can contribute its text to both neighboring
+    turns (simple "any overlap counts" match, same best-effort spirit as
+    _align_and_format_diarization's overlap matching) — acceptable for a
+    readability feature, not exact word-level alignment.
+
+    Returns None if there's nothing to render (fewer than 2 distinct
+    speakers, or no segments/turns) — same soft-fail contract as
+    _align_and_format_diarization/_diarize_with_claude.
+    """
+    if not whisper_segments or not diar_segments:
+        return None
+
+    speaker_order: List[str] = []  # first-appearance order → "Speaker 0", "Speaker 1", ...
+    for turn in diar_segments:
+        if turn["speaker"] not in speaker_order:
+            speaker_order.append(turn["speaker"])
+    if len(speaker_order) < 2:
+        return None  # single speaker — same threshold as the "1. kişi" format
+    speaker_number = {spk: i for i, spk in enumerate(speaker_order)}  # 0-based
+
+    lines: List[str] = []
+    for turn in sorted(diar_segments, key=lambda d: d["start"]):
+        overlapping_text = " ".join(
+            seg["text"] for seg in whisper_segments
+            if min(seg["end"], turn["end"]) - max(seg["start"], turn["start"]) > 0
+        )
+        if not overlapping_text:
+            continue
+        lines.append(f"Speaker {speaker_number[turn['speaker']]}")
+        lines.append(f"{turn['start']:.2f}")
+        lines.append(overlapping_text)
+        lines.append(f"{turn['end']:.2f}")
+
+    return "\n".join(lines) if lines else None
+
+
 @api_router.get("/")
 async def root():
     return {"message": "SesDeşifre API"}
@@ -657,6 +712,7 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     language: Optional[str] = Form(default="tr"),
     quality_mode: str = Form(default=QUALITY_MODE_STANDARD),
+    enable_diarization: bool = Form(default=False),
 ):
     """Transcribe an audio (or video) file using OpenAI Whisper.
 
@@ -683,8 +739,21 @@ async def transcribe_audio(
     - The `text` field is broken into lines at natural pauses (gaps between
       Whisper segments longer than PAUSE_THRESHOLD_SECONDS) for readability —
       see _format_transcript_with_pauses. This is NOT diarization: no speaker
-      labels are added, only line breaks. `diarized_text` (speaker-labeled,
-      currently only produced in api mode) is unaffected by this.
+      labels are added, only line breaks. `diarized_text`/`speaker_timeline`
+      are unaffected by this.
+    - `enable_diarization` (bool, default False — opt-in, since diarization
+      is slow: pyannote.audio in local mode, an extra Claude call in api
+      mode). When true: `diarized_text` is populated (old "1. kişi: …"
+      format, unchanged — _diarize_local in local mode, _diarize_with_claude
+      in api mode) AND `speaker_timeline` is populated in local mode only
+      (new "Speaker {n}\n{start:.2f}\n{text}\n{end:.2f}" format, 0-based
+      speaker numbers — see _format_speaker_timeline). `speaker_timeline` is
+      always null in api mode: _diarize_with_claude only ever sees the
+      final transcribed text, never real audio timing, so it has no honest
+      way to produce real per-speaker timestamps — that requires local
+      mode's actual pyannote turns + Whisper segment timestamps. When false
+      (default), behavior is identical to diarization not existing at all —
+      no performance cost, both fields are always null.
     """
     if quality_mode not in QUALITY_MODES:
         raise HTTPException(
@@ -734,24 +803,27 @@ async def transcribe_audio(
             logger.exception("Local transcription failed")
             raise HTTPException(status_code=500, detail=f"Yerel transkripsiyon başarısız: {str(e)}")
 
-        # Diarization (_diarize_local) is intentionally NOT called in local
-        # mode: pyannote.audio adds substantial CPU time on top of Whisper
-        # (no GPU on the target VPS), and the transcription-accuracy work
-        # this mode exists for doesn't need speaker labels. diarized_text is
-        # always None here. The pipeline code above (_diarize_local,
-        # _align_and_format_diarization) is left in place, untouched, so
-        # this can be re-enabled later by uncommenting the block below —
-        # see CLAUDE.md / README.md "Local mode" for how to turn it back on.
+        # Diarization (_diarize_local) is opt-in via enable_diarization
+        # (default False): pyannote.audio adds substantial CPU time on top
+        # of Whisper (no GPU on the target VPS), so it stays off by default
+        # to keep local mode's performance-first behavior — see CLAUDE.md
+        # "Bilinen Kritik Sorunlar" for the original all-or-nothing decision
+        # this opt-in flag replaces. When requested, a diarization failure
+        # never fails the whole request (soft-fail, same as api mode).
         diarized_text = None
-        # try:
-        #     diar_segments = _diarize_local(contents, ext)
-        #     diarized_text = _align_and_format_diarization(whisper_segments, diar_segments)
-        # except Exception:
-        #     logger.exception("Local diarization failed")
+        speaker_timeline = None
+        if enable_diarization:
+            try:
+                diar_segments = _diarize_local(contents, ext)
+                diarized_text = _align_and_format_diarization(whisper_segments, diar_segments)
+                speaker_timeline = _format_speaker_timeline(whisper_segments, diar_segments)
+            except Exception:
+                logger.exception("Local diarization failed")
 
         return {
             "text": raw_text,
             "diarized_text": diarized_text,
+            "speaker_timeline": speaker_timeline,
             "language": lang_code,
             "filename": file.filename,
             "size_bytes": size,
@@ -852,11 +924,24 @@ async def transcribe_audio(
     # with a newline too — same "\n" as within-chunk pause breaks, and a
     # no-op when there's only one chunk (the common case).
     raw_text = "\n".join(t for t in texts if t).strip()
-    diarized_text = await _diarize_with_claude(raw_text, api_key)
+
+    # Diarization (_diarize_with_claude) is opt-in via enable_diarization
+    # (default False) — an extra LLM call, no reason to pay its latency/cost
+    # when nobody asked for speaker labels. speaker_timeline stays null in
+    # api mode even when enabled: _diarize_with_claude only ever sees the
+    # final transcribed text, never real audio timing, so there's no honest
+    # way to derive real per-speaker timestamps from it — see
+    # _format_speaker_timeline's docstring and transcribe_audio's own
+    # docstring for the full explanation. Use local mode for speaker_timeline.
+    diarized_text = None
+    speaker_timeline = None
+    if enable_diarization:
+        diarized_text = await _diarize_with_claude(raw_text, api_key)
 
     return {
         "text": raw_text,
         "diarized_text": diarized_text,
+        "speaker_timeline": speaker_timeline,
         "language": lang_code,
         "filename": file.filename,
         "size_bytes": size,

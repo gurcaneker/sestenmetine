@@ -460,3 +460,73 @@ Sıralama: security → cleanup → consistency → test → infra → docs (CLA
   (api-mode segment/kelime normalizasyonu, 4 test) ve `_transcribe_local`'ın
   gerçekten pause-formatting'e sarıldığını doğrulayan bir entegrasyon testi
   eklendi. Tam paket: 49 test geçti, 4 skip, 0 hata.
+
+**2026-07-28 — diarization opt-in olarak yeniden etkinleştirildi + yeni zaman damgalı format**
+- Önceki karar ("Local mode'da diarization devre dışı bırakıldı", yukarıda)
+  **tamamen geri alınmadı** — sadece opt-in'e çevrildi. `/api/transcribe`'a
+  yeni bir opsiyonel form alanı: `enable_diarization` (bool, varsayılan
+  `false`). `true` olduğunda local mode'da `_diarize_local()`, api mode'da
+  `_diarize_with_claude()` çağrılıyor — **ikisi de tamamen değişmeden**,
+  sadece çağrı koşullu hale geldi (görevin açık kısıtı). `false`
+  (varsayılan) iken davranış eskisiyle birebir aynı — performans maliyeti
+  sıfır.
+- **Yeni format:** Yeni bir `_format_speaker_timeline(whisper_segments,
+  diar_segments)` fonksiyonu, mevcut `_align_and_format_diarization`'a HİÇ
+  dokunmadan (o fonksiyon aynen kaldı, testleri değişmedi) şu formatı
+  üretiyor:
+  ```
+  Speaker {n}
+  {start:.2f}
+  {text}
+  {end:.2f}
+  ```
+  Konuşmacı numaraları **0-tabanlı** (eski "1. kişi" formatı 1-tabanlıydı).
+  **Tasarım kararı — turn-driven, segment-merge değil:** İlk tasarım
+  `_align_and_format_diarization`'ın yaptığı gibi ardışık aynı-konuşmacı
+  segmentlerini TEK bloğa birleştirecekti, ama görevin kendi örneği bunun
+  YANLIŞ olduğunu gösteriyordu — örnekte aynı konuşmacının (Speaker 0) arada
+  bir duraklamayla ayrılan İKİ AYRI bloğu var, birleştirilmemiş. Kök neden:
+  pyannote iki ayrı "turn" üretiyor (aynı speaker label'ıyla ama farklı
+  start/end), ve eğer sadece speaker LABEL'ına göre gruplarsanız bu iki
+  turn'ü yanlışlıkla tek blokta birleştirirsiniz. Çözüm: fonksiyon doğrudan
+  `diar_segments`'in (pyannote turn'leri) ÜZERİNDE dönüyor, her turn kendi
+  bloğu oluyor (üst üste binen Whisper metnini o turn'e ekliyor) — speaker
+  label sadece görüntüleme numarası için kullanılıyor, gruplama için değil.
+  Bu, görevin kendi örneğiyle birebir eşleşecek şekilde birim testiyle
+  doğrulandı.
+- **`speaker_timeline` api mode'da bilinçli olarak her zaman `null`:**
+  `_diarize_with_claude()` sadece nihai transkript metnini görüyor (audio'ya
+  hiç erişimi yok), bu yüzden gerçek saniye-hassasiyetinde zaman damgası
+  üretmesinin dürüst/güvenilir bir yolu yok. Bunun yerine Claude'a
+  segment-numaralı bir liste gönderip yapısal bir "hangi segment hangi
+  konuşmacı" cevabı isteyip kendi zaman verimizle birleştirmek gibi daha
+  karmaşık bir tasarım da değerlendirildi, ama görevin "mevcut kod hâlâ
+  duruyor, sadece çağrı koşullu hale gelsin" kısıtına ve test edilebilirlik
+  önceliğine (`EMERGENT_LLM_KEY` bu dev ortamında yok, böyle bir mekanizma
+  hiç canlı test edilemezdi) dayanarak daha basit, dürüst, tamamen mock'lu
+  test edilebilir bu karar tercih edildi: api mode'da `diarized_text` eski
+  formatta dolar (değişmeden), `speaker_timeline` sadece local mode'a özgü
+  kalır. Bu net bir şekilde hem kodda hem CLAUDE.md/README.md'de belgelendi.
+- Eski `diarized_text` alanına **hiç dokunulmadı** — geriye dönük uyumluluk
+  tam korundu, `speaker_timeline` tamamen ek/opsiyonel bir alan.
+- Gerçek sunucu üzerinden, gerçek bir `HF_TOKEN` ile local mode +
+  `enable_diarization=true` uçtan uca doğrulandı: pyannote pipeline'ı
+  gerçekten çalıştı (log'da "Loading pyannote/speaker-diarization-3.1
+  pipeline..." görüldü), tek konuşmacılı bir klipte beklenen şekilde her
+  iki alan da `null` döndü (soft "tek konuşmacı" durumu, çökme yok).
+- Frontend (`Transcriber.jsx`): "Konuşmacıları ayır (yavaş)" checkbox'ı
+  eklendi (quality-mode panelinin altında, varsayılan kapalı), `enable_
+  diarization` form alanına ekleniyor. Yeni `SpeakerTimeline` bileşeni
+  (eski `DiarizedText`'ten tamamen ayrı, ona dokunulmadı) `speaker_timeline`
+  doluysa ana transkript metninin altında ayrı bir bölümde gösteriyor —
+  her blok için renk kodlu "Speaker N" etiketi + saniye cinsinden
+  başlangıç/bitiş. Parse mantığı node ile de doğrulandı (backend'in ürettiği
+  formatla birebir eşleşiyor).
+- Test: `test_local_mode.py`'ye yeni `TestFormatSpeakerTimeline` (6 test —
+  görevin kendi örneğiyle birebir eşleşen bir test dahil, 0-tabanlı
+  numaralandırma, 2 ondalık basamak, tek-konuşmacı/boş girdi None
+  senaryoları) ve `TestLocalModeDiarizationOptIn` (eski
+  `TestLocalModeDiarizationDisabled`'ın yerine geçti — varsayılan kapalı
+  davranış, `enable_diarization=true` ile her iki alanın da doğru dolduğu,
+  diarization hatasının soft-fail olduğu, hepsi mock'lu) eklendi. Tam
+  paket: 57 test geçti, 4 skip, 0 hata.

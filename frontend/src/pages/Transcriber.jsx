@@ -68,6 +68,7 @@ export default function Transcriber() {
   const [error, setError] = useState(null);
   const [showDiarized, setShowDiarized] = useState(true);
   const [qualityMode, setQualityMode] = useState("standard"); // "standard" | "precise"
+  const [enableDiarization, setEnableDiarization] = useState(false); // opt-in, slow
   const inputRef = useRef(null);
   const [dragOver, setDragOver] = useState(false);
 
@@ -118,6 +119,7 @@ export default function Transcriber() {
     form.append("file", file);
     form.append("language", "tr");
     form.append("quality_mode", qualityMode);
+    form.append("enable_diarization", enableDiarization ? "true" : "false");
 
     try {
       const res = await axios.post(`${API}/transcribe`, form, {
@@ -447,6 +449,28 @@ export default function Transcriber() {
                     <span className="font-mono">BENCHMARK.md</span>). Net/temiz
                     kayıtlarda iki mod da aynı sonucu üretebilir.
                   </div>
+
+                  <label
+                    className="mt-5 flex items-start gap-2.5 cursor-pointer select-none"
+                    data-testid="enable-diarization-toggle"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={enableDiarization}
+                      onChange={(e) => setEnableDiarization(e.target.checked)}
+                      className="mt-0.5 w-4 h-4 accent-black cursor-pointer"
+                    />
+                    <span>
+                      <span className="text-sm font-medium text-black">
+                        Konuşmacıları ayır (yavaş)
+                      </span>
+                      <span className="block mt-0.5 text-xs text-gray-600 max-w-prose">
+                        Kim ne zaman konuştu bilgisini zaman damgalarıyla üretir.
+                        Ekstra bir işlem adımı olduğu için transkripsiyonu
+                        belirgin şekilde yavaşlatır — varsayılan kapalı.
+                      </span>
+                    </span>
+                  </label>
                 </div>
               )}
 
@@ -569,6 +593,18 @@ export default function Transcriber() {
                 )}
               </div>
 
+              {result.speaker_timeline && (
+                <div className="mt-6 pt-6 border-t border-black/10" data-testid="speaker-timeline-panel">
+                  <div className="tech-label mb-3 flex items-center gap-2">
+                    <Users className="w-3.5 h-3.5" />
+                    Konuşmacı Zaman Çizelgesi
+                  </div>
+                  <div className="max-h-[40vh] overflow-y-auto custom-scrollbar pl-4 border-l-2 border-black/10">
+                    <SpeakerTimeline text={result.speaker_timeline} />
+                  </div>
+                </div>
+              )}
+
               <div className="flex flex-wrap justify-end gap-3 mt-6 border-t border-black/10 pt-5">
                 <button
                   onClick={copyText}
@@ -672,6 +708,50 @@ function DiarizedText({ text }) {
               </span>
             </div>
             <p className="text-gray-800 flex-1 leading-relaxed">{body}</p>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Renders the opt-in speaker_timeline field — backend/server.py
+// _format_speaker_timeline's "Speaker {n}\n{start:.2f}\n{text}\n{end:.2f}"
+// blocks, repeated. Distinct from DiarizedText above: this is timestamped
+// (0-based "Speaker N", real start/end seconds per turn), that one is the
+// older, un-timestamped "N. kişi:" format (diarized_text).
+function SpeakerTimeline({ text }) {
+  const lines = text.split("\n");
+  const blocks = [];
+  for (let i = 0; i + 3 < lines.length; i += 4) {
+    const match = lines[i].match(/^Speaker\s+(\d+)$/i);
+    if (!match) continue;
+    blocks.push({
+      num: parseInt(match[1], 10),
+      start: lines[i + 1],
+      body: lines[i + 2],
+      end: lines[i + 3],
+    });
+  }
+
+  return (
+    <div className="space-y-4">
+      {blocks.map((b, i) => {
+        const color = SPEAKER_COLORS[b.num % SPEAKER_COLORS.length];
+        return (
+          <div key={i} className="flex gap-3">
+            <div className="flex-shrink-0 pt-0.5 flex flex-col items-start gap-1 w-24">
+              <span
+                className="tech-label !text-[10px] !text-white px-2 py-1 inline-block"
+                style={{ backgroundColor: color }}
+              >
+                Speaker {b.num}
+              </span>
+              <span className="font-mono text-[10px] text-gray-500">
+                {b.start}s–{b.end}s
+              </span>
+            </div>
+            <p className="text-gray-800 flex-1 leading-relaxed">{b.body}</p>
           </div>
         );
       })}

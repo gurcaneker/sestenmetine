@@ -106,16 +106,12 @@ Anthropic Claude kullanır (`EMERGENT_LLM_KEY` gerekir). Alternatif olarak
 tamamen yerelde, ilk model indirmesinden sonra **offline** çalışır —
 `EMERGENT_LLM_KEY` gerekmez.
 
-> ⚠️ **Diarization (konuşmacı ayrımı) local mode'da şu an devre dışı.**
-> `_diarize_local()`/pyannote.audio uçtan uca doğrulandı ve çalışıyor
-> (aşağıdaki adımlar hâlâ geçerli, kod silinmedi), ama hedef deploy ortamı
-> (VPS, GPU yok) için Whisper'ın üzerine pyannote'un CPU maliyeti kabul
-> edilemez derecede yüksek çıktı — bu yüzden endpoint artık onu hiç
-> çağırmıyor, `diarized_text` local mode'da her zaman `null` döner. Yeniden
-> açmak için `backend/server.py`'de `transcribe_audio()` içindeki, yorum
-> satırına alınmış `_diarize_local`/`_align_and_format_diarization` çağrı
-> bloğunun yorumunu kaldırın (bkz. kod yorumu). API mode (Claude ile
-> diarization) bundan etkilenmedi, aynı şekilde çalışmaya devam ediyor.
+> ℹ️ **Diarization (konuşmacı ayrımı) opsiyonel/opt-in — varsayılan kapalı.**
+> Hedef deploy ortamı (VPS, GPU yok) için Whisper'ın üzerine pyannote'un CPU
+> maliyeti belirgin, bu yüzden `/api/transcribe` varsayılan olarak
+> diarization çalıştırmaz (performans önceliği). İsteyen kullanıcı
+> `enable_diarization=true` göndererek açabilir — bkz. aşağıdaki
+> "Konuşmacı ayrımı (diarization, opt-in)" bölümü.
 
 **1) Hugging Face token alın (manuel, siz yapmalısınız):**
 1. https://huggingface.co adresinde hesap oluşturun/giriş yapın.
@@ -152,10 +148,10 @@ sizin donanımınız/ses kaliteniz için doğru olduğuna karar vermeden önce
 **`BENCHMARK.md`**'ye bakın — 4 çekirdekli bir ortamda ölçülen hız/model
 boyutu karşılaştırması orada.
 
-Yukarıdaki HF_TOKEN adımları diarization şu an kapalıyken de geçerli:
-`TRANSCRIPTION_BACKEND=local` fail-fast mantığı hâlâ `HF_TOKEN` bekliyor
-(ileride tekrar açılabilmesi için bilinçli olarak kaldırılmadı — bkz.
-yukarıdaki devre dışı bırakma notu).
+Yukarıdaki HF_TOKEN adımları `enable_diarization=true` göndermeseniz bile
+geçerli: `TRANSCRIPTION_BACKEND=local` fail-fast mantığı her zaman
+`HF_TOKEN` bekler (diarization talep edilmese bile — basit tutmak için
+tercih edildi, aşağıda ayrıca not düşülmedi).
 
 **Her istekte hız/doğruluk seçimi (`quality_mode`):** `/api/transcribe`'a
 opsiyonel bir form alanı gönderebilirsiniz — `quality_mode=standard`
@@ -178,15 +174,62 @@ sonlarını doğru gösteriyor. Eşik değeri (`PAUSE_THRESHOLD_SECONDS`) kod
 içinde sabit, env değişkeni değil — değiştirmek isterseniz `backend/server.py`
 içinde düzenleyin.
 
-Diarization yeniden açıldığında geçerli olacak davranış (kod hazır, aşağıdaki
-gibi uçtan uca doğrulandı): pipeline yüklenemez/başarısız olursa istek
-**başarısız olmaz** — `_diarize_with_claude`'un API-mode'daki davranışıyla
-aynı: hata loglanır, `diarized_text: null` ile düz transkript dönülür. Ses,
-pyannote'a dosya yolu yerine `av` ile kendi decode ettiğimiz bir waveform
-olarak veriliyor, bu yüzden diarization için sistemde ayrıca ffmpeg kurulu
-olması gerekmiyor (Docker image'ında zaten var). Gerçek bir HF token ve
-birden fazla konuşmacı içeren bir kayıtla uçtan uca doğru "1. kişi / 2. kişi"
-çıktısı üretildiği manuel olarak test edildi — bkz. `memory/PRD.md` changelog.
+### Konuşmacı ayrımı (diarization, opt-in)
+
+`/api/transcribe`'a opsiyonel bir form alanı gönderebilirsiniz —
+`enable_diarization=true` (varsayılan `false`). Bu **ekstra bir işlem
+adımı** olduğu için transkripsiyonu belirgin şekilde yavaşlatır (local
+mode'da pyannote.audio çalışır, api mode'da ekstra bir Claude çağrısı
+yapılır) — bu yüzden varsayılan kapalı, sadece isteyen açar.
+
+`true` olduğunda iki alan doldurulur:
+
+- **`diarized_text`** — eski, halihazırda var olan format
+  (`"1. kişi: … \n2. kişi: …"`, 1-tabanlı, zaman damgasız). Hem local mode
+  (`_diarize_local` + `_align_and_format_diarization`) hem api mode
+  (`_diarize_with_claude`) bunu üretebilir.
+- **`speaker_timeline`** — yeni, zaman damgalı format, **sadece local
+  mode'da** dolar:
+  ```
+  Speaker 0
+  00.08
+  Yetiyor mu yani bunlar?
+  01.06
+  Speaker 0
+  02.18
+  Böyle mi yaşamayı düşünüyorsun?...
+  09.50
+  Speaker 1
+  09.50
+  Başka hiçbir şey olmaz...
+  13.66
+  ```
+  Konuşmacı numaraları **0-tabanlı** ("Speaker 0", "Speaker 1" — eski
+  formattaki "1. kişi"den farklı olarak). Her blok pyannote'un kendi
+  konuşma "turn"üne karşılık gelir — aynı konuşmacının arada duraklamayla
+  ayrılan iki ayrı turn'ü TEK bloğa birleştirilmez, ayrı ayrı kalır (yukarıdaki
+  örnekte iki ayrı "Speaker 0" bloğu böyle oluşuyor). `_format_speaker_
+  timeline()` fonksiyonu üretir.
+
+  **`speaker_timeline` api mode'da her zaman `null`** — `_diarize_with_claude`
+  sadece nihai transkript metnini görüyor, gerçek ses zaman bilgisine hiç
+  erişmiyor; bir LLM'in metinden gerçek saniye-hassasiyetinde zaman damgası
+  üretmesinin dürüst bir yolu yok. Zaman damgalı konuşmacı ayrımı istiyorsanız
+  `TRANSCRIPTION_BACKEND=local` kullanın.
+
+`enable_diarization=false` (varsayılan) iken davranış tamamen eskisi gibi —
+her iki alan da her zaman `null`, performans maliyeti yok.
+
+Diarization pipeline'ı yüklenemez/başarısız olursa istek **başarısız olmaz**
+— hata loglanır, ilgili alan(lar) `null` kalır, düz transkript yine dönülür
+(soft-fail, her iki modda da aynı). Ses, pyannote'a dosya yolu yerine `av`
+ile kendi decode ettiğimiz bir waveform olarak veriliyor, bu yüzden
+diarization için sistemde ayrıca ffmpeg kurulu olması gerekmiyor (Docker
+image'ında zaten var). Gerçek bir HF token ile gerçek sunucu üzerinden
+uçtan uca doğrulandı (bkz. `memory/PRD.md` changelog) — hem eski format
+(birden fazla konuşmacı içeren bir kayıtla doğru "1. kişi / 2. kişi" çıktısı)
+hem yeni `enable_diarization` gate'i (gerçek pyannote çağrısı, tek konuşmacılı
+bir klipte beklenen şekilde soft-null döndüğü) test edildi.
 
 ## Test Çalıştırma
 

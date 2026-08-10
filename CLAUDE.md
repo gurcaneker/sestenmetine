@@ -99,11 +99,10 @@ gönderip konuşmacı ayrımı yaptır (hata durumunda sessizce None dönüyor).
 `vad_filter=True` + `batch_size=WHISPER_BATCH_SIZE` + `cpu_threads=
 _local_cpu_threads()` — `os.sched_getaffinity(0)` tabanlı, cgroup/container-
 farkında — + `word_timestamps=True`, segment+kelime+timestamp'li; bkz.
-`BENCHMARK.md`) → `diarized_text` her zaman `null` döner. **Diarization (`_diarize_local()` + `_align_and_format_diarization()`)
-şu an devre dışı** — hedef VPS'te (GPU yok) pyannote'un CPU maliyeti kabul
-edilemez bulundu; kod silinmedi, `transcribe_audio()` içinde çağrı yorum
-satırına alındı (bkz. kod yorumu ve README.md "Local mode ile çalıştırma"
-— yeniden açma talimatı orada). API mode bundan etkilenmez.
+`BENCHMARK.md`) → `diarized_text`/`speaker_timeline` her zaman `null` döner
+— **diarization opt-in** (`enable_diarization=true` gerekir, bkz. aşağıdaki
+madde; varsayılan `false`, performans önceliği korunuyor). API mode'da da
+aynı şekilde opt-in (`_diarize_with_claude()`), varsayılan kapalı.
 
 `/api/transcribe`'ın `quality_mode` form alanı (`"standard"` varsayılan,
 veya `"precise"`) sadece local mode'u etkiler: `"standard"` → `WHISPER_MODEL_SIZE`,
@@ -113,6 +112,14 @@ model de ayrı ayrı, sadece talep edildiklerinde belleğe yüklenip cache'lenir
 dict) — bir mod hiç istenmediyse hiç yüklenmez, aynı modda art arda gelen
 istekler yeniden yükleme maliyeti ödemez. Detay ve doğruluk/hız karşılaştırması:
 `BENCHMARK.md` "Bulgu 4".
+
+`enable_diarization` form alanı (bool, varsayılan `false`) diarization'ı
+opt-in yapar: `true` iken `diarized_text` (eski "1. kişi:" formatı, her iki
+modda) VE local mode'da ayrıca `speaker_timeline` (yeni, 0-tabanlı
+"Speaker {n}\n{start:.2f}\n{text}\n{end:.2f}" formatı, `_format_speaker_
+timeline()`) doldurulur. `speaker_timeline` api mode'da her zaman `null` —
+`_diarize_with_claude()`'ın gerçek zaman bilgisine erişimi yok. Varsayılan
+`false` iken davranış tamamen eskisi gibi (performans maliyeti yok).
 
 ## Bilinen Kritik Sorunlar
 
@@ -187,7 +194,8 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
   bir `requirements-local.txt`'e taşıyıp Docker build'e opsiyonel bir
   `ARG`/build-stage ile bağlamak (yapılırsa `docker-compose.yml` ve
   `backend/Dockerfile` güncellenmeli).
-- **Local mode'da diarization devre dışı bırakıldı (2026-07-28):**
+- **Local mode'da diarization devre dışı bırakıldı (2026-07-28, sonradan
+  opt-in'e çevrildi — bkz. aşağıdaki "enable_diarization" girdisi):**
   `_diarize_local()`/`_align_and_format_diarization()` uçtan uca doğrulanmış
   ve çalışır durumdaydı, ama hedef VPS'te GPU olmadığı için pyannote.audio'nun
   Whisper'ın üzerine eklediği CPU süresi kabul edilemez bulundu — bu proje
@@ -297,6 +305,48 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
   (saf mantık, 7 test) + `TestNormalizeOpenAISegments` (4 test) + bir
   entegrasyon testi eklendi. Tam paket: 49 test geçti, 4 skip, 0 hata.
   Detay: README.md.
+- **Diarization opt-in olarak yeniden etkinleştirildi, yeni zaman damgalı
+  format ile (2026-07-28):** `/api/transcribe`'a yeni bir opsiyonel form
+  alanı — `enable_diarization` (bool, varsayılan `false`). `true` olduğunda:
+  local mode'da `_diarize_local()`, api mode'da `_diarize_with_claude()`
+  çağrılır (**ikisi de değişmeden** — sadece çağrı koşullu hale geldi,
+  görev tanımının açık kısıtı). `false` (varsayılan) iken davranış tamamen
+  eskisi gibi — performans maliyeti sıfır, önceki "diarization tamamen
+  kapalı" kararı geri alınmadı, sadece opt-in'e çevrildi.
+  - **Yeni format, sadece local mode'da:** `_format_speaker_timeline()`
+    (yeni fonksiyon, dokunulmamış `_align_and_format_diarization`'ın
+    yanında) pyannote'un turn'lerini (`diar_segments`) doğrudan kullanarak
+    `Speaker {n}\n{start:.2f}\n{text}\n{end:.2f}` bloklarını üretir —
+    speaker numaraları **0-tabanlı** ("Speaker 0", eski "1. kişi" formatının
+    1-tabanlı olmasından farklı). Turn-driven (segment-merge değil): aynı
+    konuşmacının iki AYRI pyannote turn'ü (arada duraklama varsa) tek bloğa
+    birleştirilmez, ayrı ayrı kalır — göreve verilen örnek çıktı formatı
+    tam olarak bunu gösteriyor. Yeni `speaker_timeline` alanında dönüyor,
+    **eski `diarized_text` alanına hiç dokunulmadı** (geriye dönük uyumluluk,
+    aynı anda ikisi de doldurulabilir).
+  - **API mode'da `speaker_timeline` bilinçli olarak her zaman `null`:**
+    `_diarize_with_claude()` sadece nihai transkript METNİNİ görüyor, asla
+    gerçek ses zaman bilgisine erişmiyor — bir LLM'in metinden gerçek
+    saniye-hassasiyetinde zaman damgası üretmesinin dürüst bir yolu yok.
+    Yeni zaman damgalı format gerçek zaman verisi gerektiriyor (pyannote
+    turn'leri + Whisper segment timestamp'leri), bu sadece local mode'da
+    var. `diarized_text` (eski format) api mode'da hâlâ `enable_diarization=
+    true` ile dolduruluyor, sadece `speaker_timeline` boş kalıyor.
+  - Gerçek sunucu üzerinden, gerçek bir `HF_TOKEN` ile uçtan uca doğrulandı
+    (pyannote pipeline'ı gerçekten çalıştı, tek konuşmacılı bir klipte
+    beklenen şekilde her iki alan da `null` döndü — soft-fail, çökme yok).
+  - Frontend (`Transcriber.jsx`): "Konuşmacıları ayır (yavaş)" checkbox'ı
+    eklendi (varsayılan kapalı, quality-mode panelinin altında), `enable_
+    diarization` form alanına ekleniyor. `speaker_timeline` doluysa ana
+    transkript metninin altında ayrı bir "Konuşmacı Zaman Çizelgesi"
+    bölümünde yeni `SpeakerTimeline` bileşeniyle gösteriliyor (eski
+    `DiarizedText` bileşeninden ayrı, ona hiç dokunulmadı).
+  - Test: `test_local_mode.py`'ye yeni `TestFormatSpeakerTimeline` (6 test,
+    göreve verilen örnekle birebir eşleşen bir test dahil) ve
+    `TestLocalModeDiarizationOptIn` (eski `TestLocalModeDiarizationDisabled`
+    yerine geçti — varsayılan kapalı, açıkken her iki alanın da dolduğu,
+    diarization hatasının soft-fail olduğu) eklendi. Tam paket: 57 test
+    geçti, 4 skip, 0 hata.
 
 ## Sabit Kurallar (Claude Code her zaman uymalı)
 

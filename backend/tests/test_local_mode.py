@@ -138,6 +138,115 @@ class TestAlignAndFormatDiarization:
         ) is None
 
 
+class TestFormatSpeakerTimeline:
+    """Pure Python logic (turn-driven timestamp rendering) — no ML models
+    involved, tested for real. This is the NEW opt-in diarization format
+    (enable_diarization=true, local mode only) — contrast with
+    TestAlignAndFormatDiarization above, which covers the older, still-
+    unchanged "1. kişi: …" format (diarized_text)."""
+
+    def test_matches_task_example_format(self, monkeypatch):
+        """Synthetic input modeled directly on the task's own worked example:
+        two separate Speaker 0 turns (NOT merged into one, since they're two
+        distinct pyannote turns with a pause between them) followed by a
+        Speaker 1 turn."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        whisper_segments = [
+            {"start": 0.08, "end": 1.06, "text": "Yetiyor mu yani bunlar?"},
+            {"start": 2.18, "end": 9.50, "text": "Böyle mi yaşamayı düşünüyorsun?..."},
+            {"start": 9.50, "end": 13.66, "text": "Başka hiçbir şey olmaz..."},
+        ]
+        diar_segments = [
+            {"start": 0.08, "end": 1.06, "speaker": "SPEAKER_00"},
+            {"start": 2.18, "end": 9.50, "speaker": "SPEAKER_00"},
+            {"start": 9.50, "end": 13.66, "speaker": "SPEAKER_01"},
+        ]
+        result = server._format_speaker_timeline(whisper_segments, diar_segments)
+        assert result == (
+            "Speaker 0\n"
+            "0.08\n"
+            "Yetiyor mu yani bunlar?\n"
+            "1.06\n"
+            "Speaker 0\n"
+            "2.18\n"
+            "Böyle mi yaşamayı düşünüyorsun?...\n"
+            "9.50\n"
+            "Speaker 1\n"
+            "9.50\n"
+            "Başka hiçbir şey olmaz...\n"
+            "13.66"
+        )
+
+    def test_timestamps_use_two_decimal_places(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        whisper_segments = [
+            {"start": 0.0, "end": 1.0, "text": "a"},
+            {"start": 1.0, "end": 2.5, "text": "b"},
+        ]
+        diar_segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "X"},
+            {"start": 1.0, "end": 2.5, "speaker": "Y"},
+        ]
+        result = server._format_speaker_timeline(whisper_segments, diar_segments)
+        lines = result.split("\n")
+        assert lines[1] == "0.00"
+        assert lines[3] == "1.00"
+        assert lines[5] == "1.00"
+        assert lines[7] == "2.50"
+
+    def test_speaker_numbers_are_zero_based_by_first_appearance(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        # SPEAKER_01 talks first — numbering must follow appearance order,
+        # not the raw pyannote label (contrast with the 1-based "1. kişi"
+        # format — this one starts at "Speaker 0").
+        whisper_segments = [
+            {"start": 0.0, "end": 1.0, "text": "ilk"},
+            {"start": 1.0, "end": 2.0, "text": "ikinci"},
+        ]
+        diar_segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_01"},
+            {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_00"},
+        ]
+        result = server._format_speaker_timeline(whisper_segments, diar_segments)
+        assert result.startswith("Speaker 0\n0.00\nilk\n1.00\nSpeaker 1\n")
+
+    def test_single_speaker_returns_none(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        whisper_segments = [{"start": 0.0, "end": 2.0, "text": "Merhaba"}]
+        diar_segments = [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}]
+        assert server._format_speaker_timeline(whisper_segments, diar_segments) is None
+
+    def test_empty_inputs_return_none(self, monkeypatch):
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        assert server._format_speaker_timeline([], []) is None
+        assert server._format_speaker_timeline(
+            [{"start": 0.0, "end": 1.0, "text": "x"}], []
+        ) is None
+
+    def test_does_not_mutate_diarized_text_format(self, monkeypatch):
+        """Explicit regression guard: the new format must never look like
+        the old "1. kişi:" format (and vice versa is covered by
+        TestAlignAndFormatDiarization, which is untouched by this feature)."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+        whisper_segments = [
+            {"start": 0.0, "end": 1.0, "text": "a"},
+            {"start": 1.0, "end": 2.0, "text": "b"},
+        ]
+        diar_segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "X"},
+            {"start": 1.0, "end": 2.0, "speaker": "Y"},
+        ]
+        result = server._format_speaker_timeline(whisper_segments, diar_segments)
+        assert "kişi" not in result.lower()
+        assert result.startswith("Speaker 0\n")
+
+
 class TestFormatTranscriptWithPauses:
     """Pure Python logic (gap-based line breaking) — no ML models involved,
     tested for real rather than mocked. This is readability-only formatting,
@@ -513,16 +622,17 @@ class TestQualityMode:
         assert "quality_mode" in resp.json()["detail"]
 
 
-class TestLocalModeDiarizationDisabled:
-    """Diarization is currently disabled in local mode (CPU-time cost on the
-    target VPS, no GPU) — /api/transcribe must not call _diarize_local and
-    must always return diarized_text: None. _diarize_local /
-    _align_and_format_diarization themselves are left untouched (see
-    server.py comment above the commented-out call) so this is purely about
-    the endpoint not invoking them — see CLAUDE.md "Bilinen Kritik Sorunlar"
-    for how to re-enable."""
+class TestLocalModeDiarizationOptIn:
+    """Diarization in local mode is opt-in via enable_diarization (default
+    False) — was previously disabled outright (CPU-time cost on the target
+    VPS, no GPU; see CLAUDE.md "Bilinen Kritik Sorunlar"), now gated behind
+    the flag instead so the default (fast, no diarization) behavior is
+    unchanged but a caller who wants speaker labels/timestamps can opt in.
+    _diarize_local/_align_and_format_diarization/_format_speaker_timeline
+    themselves are untouched (see server.py) — this is purely about the
+    endpoint's gating logic."""
 
-    def test_transcribe_endpoint_never_calls_diarize_local(self, monkeypatch):
+    def test_disabled_by_default_never_calls_diarize_local(self, monkeypatch):
         from fastapi.testclient import TestClient
 
         _fake_local_mode_env(monkeypatch)
@@ -549,9 +659,73 @@ class TestLocalModeDiarizationDisabled:
         body = resp.json()
         assert body["text"] == "Merhaba"
         assert body["diarized_text"] is None
+        assert body["speaker_timeline"] is None
         mock_transcribe.assert_called_once()
         mock_diarize.assert_not_called()
         mock_align.assert_not_called()
+
+    def test_enabled_populates_both_diarization_fields(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        fake_whisper_segments = [
+            {"start": 0.0, "end": 1.0, "text": "Merhaba,"},
+            {"start": 1.0, "end": 2.0, "text": "nasılsın?"},
+        ]
+        fake_diar_segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"},
+            {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_01"},
+        ]
+        with patch.object(server, "_verify_media_stream"), patch.object(
+            server, "_transcribe_local", return_value=("Merhaba, nasılsın?", fake_whisper_segments)
+        ), patch.object(
+            server, "_diarize_local", return_value=fake_diar_segments
+        ) as mock_diarize:
+            client = TestClient(server.app)
+            resp = client.post(
+                "/api/transcribe",
+                headers={"X-API-Key": "test-key"},
+                files={"file": ("test.wav", b"fake wav bytes", "audio/wav")},
+                data={"enable_diarization": "true"},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        mock_diarize.assert_called_once()
+        assert body["diarized_text"] == "1. kişi: Merhaba,\n2. kişi: nasılsın?"
+        assert body["speaker_timeline"] == (
+            "Speaker 0\n0.00\nMerhaba,\n1.00\nSpeaker 1\n1.00\nnasılsın?\n2.00"
+        )
+
+    def test_enabled_diarization_failure_soft_fails(self, monkeypatch):
+        """A diarization error must not fail the whole request — same
+        soft-fail contract as before this became opt-in."""
+        from fastapi.testclient import TestClient
+
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        fake_whisper_segments = [{"start": 0.0, "end": 1.0, "text": "Merhaba"}]
+        with patch.object(server, "_verify_media_stream"), patch.object(
+            server, "_transcribe_local", return_value=("Merhaba", fake_whisper_segments)
+        ), patch.object(
+            server, "_diarize_local", side_effect=RuntimeError("boom")
+        ):
+            client = TestClient(server.app)
+            resp = client.post(
+                "/api/transcribe",
+                headers={"X-API-Key": "test-key"},
+                files={"file": ("test.wav", b"fake wav bytes", "audio/wav")},
+                data={"enable_diarization": "true"},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["text"] == "Merhaba"
+        assert body["diarized_text"] is None
+        assert body["speaker_timeline"] is None
 
 
 @REQUIRES_REAL_MODELS
