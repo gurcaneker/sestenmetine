@@ -347,6 +347,77 @@ Orijinal 9 maddelik liste (security → docs ajan sırasıyla) — durum güncel
     yerine geçti — varsayılan kapalı, açıkken her iki alanın da dolduğu,
     diarization hatasının soft-fail olduğu) eklendi. Tam paket: 57 test
     geçti, 4 skip, 0 hata.
+- **🔴 REGRESYON + DÜZELTME — `speaker_timeline` gerçek çok-konuşmacılı
+  ses dosyasında tüm transkripti her bloğa tekrarlıyordu (2026-09-16):**
+  Yukarıdaki maddenin "gerçek sunucu üzerinden uçtan uca doğrulandı" notu
+  **yanıltıcıydı** — o doğrulama tek-konuşmacılı bir kliple yapılmıştı,
+  yani `_align_and_format_diarization`/`_format_speaker_timeline`'ın
+  gerçek overlap-eşleme mantığı (2+ konuşmacı gerektiren dal) hiç
+  çalıştırılmadan "soft-fail, `null` döndü" olarak yeşile boyanmıştı. Gerçek
+  çok-konuşmacılı bir kayıtta her "Speaker N" bloğu SADECE kendi turn'üne
+  ait metin yerine 17 cümlelik transkriptin TAMAMINI tekrar tekrar
+  içeriyordu ve son bloklarda başlangıç/bitiş zaman damgaları görünüşte
+  ters dönmüş gibiydi (örn. "17.88s–13.62s").
+  - **Kök neden:** `_transcribe_local()`, diarization hizalaması için
+    `_align_and_format_diarization`/`_format_speaker_timeline`'a Whisper'ın
+    kendi KABA (cümle/ifade seviyesi) `whisper_segments` listesini
+    veriyordu — tam olarak "Duraklama-tabanlı satır kırma" maddesinde
+    zaten belgelenmiş, `BatchedInferencePipeline`'ın VAD ile ayrılmış
+    konuşma bloklarını tek bir kaba `Segment`'e birleştirebildiği (gerçek
+    testte doğrulanmış) sorun. Bir kaba segment tüm klibi (hatta tüm
+    konuşmayı) kapsayınca, HER pyannote turn'ü o segmentle overlap ediyor,
+    "any overlap counts" eşleştirmesi her turn'e transkriptin tamamını
+    veriyordu. Görünürdeki "ters zaman damgası" ayrı bir hata değildi —
+    bunun bir yan etkisiydi: frontend'in `SpeakerTimeline` bileşeni sabit
+    4-satır varsayımıyla parse ediyordu, gövde metni (`body`) beklenmedik
+    şekilde çok satırlı olduğunda (veya format kaymasında) sonraki blokların
+    start/end değerleri kayıyor, komşu bloklardan değer sızıyordu.
+  - **Düzeltme:** `_transcribe_local()` artık diarization için KELİME
+    seviyesi zaman damgalarını (`words`, zaten `word_timestamps=True` ile
+    hesaplanıyordu ama sadece duraklama tespiti için kullanılıyordu) döndürüyor
+    — `return raw_text, (words or whisper_segments)` (kaba segment'e düşme
+    sadece hiç kelime zaman damgası yoksa, örn. sessiz ses). Kelimeler
+    ~0.1-0.5s genişliğinde olduğu için overlap eşleştirmesi artık gerçekten
+    konuşmacılar arasında ayrım yapabiliyor. `_align_and_format_diarization`
+    ve `_format_speaker_timeline`'ın parametre adları (`whisper_words`) ve
+    docstring'leri bu beklentiyi netleştirecek şekilde güncellendi — ikisi
+    de artık segment değil kelime listesi bekliyor (fonksiyonların kendi iç
+    mantığı değişmedi, sadece hangi granülerlikte veri aldıkları).
+  - **Testin neden yakalayamadığı + düzeltme:** `TestAlignAndFormatDiarization`/
+    `TestFormatSpeakerTimeline`'daki mevcut sentetik testler zaten kelime/
+    ifade-boyutunda "segment"ler kullanıyordu (örn. 3-4 kelimelik ayrı
+    segmentler) — gerçek `_transcribe_local`'ın üretebileceği TEK KABA,
+    çok-turn'lü bir segment senaryosunu hiç simüle etmiyorlardı, ve gerçek
+    e2e doğrulama da yanlışlıkla tek-konuşmacılı (dolayısıyla bu kod yolunu
+    hiç çalıştırmayan) bir kliple yapılmıştı. Eklenen yeni testler: (1) her
+    iki fonksiyona da ~16 turn'lük, hızlı dönüşümlü, gerçekçi kelime-seviyeli
+    bir diyalog veren `test_many_short_alternating_turns_word_level` /
+    `test_realistic_many_alternating_turns_word_level` — her bloğun SADECE
+    kendi kelimelerini içerdiğini, başka turn'lerden veya tüm transkriptten
+    kelime sızmadığını doğruluyor; (2) `_transcribe_local` seviyesinde
+    `test_transcribe_local_returns_word_level_not_coarse_segments_for_diarization`
+    — TEK bir kaba segment (gerçek bug koşulunu simüle eden) birden fazla
+    gerçek kelime zaman damgası taşıdığında, dönen ikinci tuple elemanının
+    kelime listesi olduğunu, kaba segment aralığı OLMADIĞINI doğrudan
+    doğruluyor (asıl hatanın yaşandığı sınır — çağıran taraf). Frontend
+    `Transcriber.jsx`'teki `SpeakerTimeline` parser'ı da savunma amaçlı
+    sağlamlaştırıldı: artık sabit 4-satır adımı yerine "Speaker N" başlık
+    satırı + ardından bir zaman damgası satırı arayıp, bir sonraki saf
+    zaman damgası satırına kadar olan her şeyi gövde olarak alıyor — gövde
+    metninde beklenmedik bir `\n` olsa bile sonraki blokların değerleri
+    artık kaymıyor. Tam paket: 49 test geçti (backend + local_mode +
+    media_validation), 2 skip, 0 hata (bkz. `backend_test.py` ayrıca canlı
+    sunucu + `REACT_APP_BACKEND_URL` gerektirir, bu regresyonla ilgisiz).
+  - **Ders/kural:** Bir e2e doğrulama "soft-fail, null döndü" ile geçtiğinde,
+    bunun testin gerçekten ilgili kod yolunu (burada: 2+ konuşmacı dalını)
+    çalıştırdığı anlamına GELMEDİĞİNİ unutma — özellikle diarization/çok-
+    konuşmacı özellikleri için doğrulama en az 2 farklı konuşmacı içeren
+    gerçek veriyle yapılmalı, tek-konuşmacılı bir klip bu dalı hiç
+    tetiklemez. Ayrıca: birim testleri gerçek modelin/pipeline'ın
+    üretebileceği en kötü/en kaba veri şeklini (burada: VAD-merge'lenmiş tek
+    dev segment) simüle etmezse, "segment" ve "kelime" gibi farklı
+    granülerlik seviyeleri arasındaki bir karışıklık sentetik testte hiç
+    görünmeyebilir.
 
 ## Sabit Kurallar (Claude Code her zaman uymalı)
 

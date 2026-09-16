@@ -487,22 +487,30 @@ def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str], qual
     quality_mode selects which cached model/pipeline to use — see
     _get_local_whisper_pipeline/_model_size_for_quality.
 
-    Returns (raw_text, whisper_segments) where whisper_segments is a list of
-    {"start": float, "end": float, "text": str} at Whisper's own (sentence/
-    phrase-level) segment granularity — this is what pyannote's diarization
-    output aligns against in _align_and_format_diarization(), and its shape
-    is unchanged by this function.
+    Returns (raw_text, whisper_words) where whisper_words is a list of
+    {"start": float, "end": float, "text": str} at per-WORD granularity
+    (falling back to segment granularity only if faster-whisper returned no
+    word timestamps at all, e.g. silent/empty audio) — this is what
+    pyannote's diarization output aligns against in
+    _align_and_format_diarization()/_format_speaker_timeline().
 
-    raw_text is NOT simply these segments joined — it's built from per-WORD
-    timestamps instead (word_timestamps=True below) purely to find natural
-    pauses (_format_transcript_with_pauses). This was a real, tested finding
-    while building the feature: with BatchedInferencePipeline,
-    VAD-separated speech chunks can get merged back into a single coarse
-    Segment spanning a multi-second silence (verified: a synthetic clip with
-    a 3s gap came back as ONE segment covering the whole clip) — so gaps
-    between Segment.start/end are NOT a reliable pause signal here. Gaps
-    between consecutive WORDS' timestamps are — they correctly exposed the
-    same 3s gap in that test. See BENCHMARK.md.
+    Both raw_text and whisper_words are built from per-WORD timestamps
+    (word_timestamps=True below), NOT from Whisper's own coarse segments —
+    this was a real, tested finding while building this feature: with
+    BatchedInferencePipeline, VAD-separated speech chunks can get merged
+    back into a single coarse Segment spanning many seconds, even a whole
+    multi-speaker clip (verified: a synthetic clip with a 3s gap came back
+    as ONE segment covering the whole clip). That's fine for pause detection
+    (fixed by switching to word gaps — see BENCHMARK.md) but it's fatal for
+    diarization alignment specifically: a real bug shipped where
+    whisper_segments (coarse) was passed to _format_speaker_timeline/
+    _align_and_format_diarization, so on real multi-speaker audio every
+    pyannote turn overlapped the same one-or-few giant segments and every
+    "Speaker N" block ended up containing the ENTIRE transcript instead of
+    just that turn's words (see CLAUDE.md "Bilinen Kritik Sorunlar" for the
+    incident writeup). Word-level granularity is the fix: each word spans
+    ~0.1-0.5s, so overlap-matching against pyannote turns actually
+    discriminates between speakers instead of matching everything at once.
     """
     pipeline = _get_local_whisper_pipeline(quality_mode)
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
@@ -532,7 +540,9 @@ def _transcribe_local(raw_bytes: bytes, ext: str, lang_code: Optional[str], qual
                 if word_text:
                     words.append({"start": w.start, "end": w.end, "text": word_text})
         raw_text = _format_transcript_with_pauses(words or whisper_segments)
-        return raw_text, whisper_segments
+        # words (not whisper_segments) for diarization alignment — see
+        # docstring above for why the coarse segment list is unreliable here.
+        return raw_text, (words or whisper_segments)
     finally:
         try:
             os.unlink(tmp_path)
@@ -589,34 +599,43 @@ def _diarize_local(raw_bytes: bytes, ext: str) -> List[dict]:
 
 
 def _align_and_format_diarization(
-    whisper_segments: List[dict], diar_segments: List[dict]
+    whisper_words: List[dict], diar_segments: List[dict]
 ) -> Optional[str]:
-    """Assign each Whisper segment to the pyannote speaker turn with the
+    """Assign each Whisper WORD to the pyannote speaker turn with the
     largest time overlap, then render "1. kişi: … / 2. kişi: …" blocks —
     the exact same textual format _diarize_with_claude() produces, so the
     frontend (which parses this format — see Transcriber.jsx DiarizedText)
     needs no changes regardless of which backend produced it.
 
+    whisper_words must be per-word granularity (see _transcribe_local),
+    NOT Whisper's own coarse segments — passing coarse segments here was a
+    real, shipped bug: BatchedInferencePipeline can merge many VAD-separated
+    speech chunks into one giant Segment spanning most/all of a multi-
+    speaker clip, so every pyannote turn ends up overlapping that same
+    giant segment and every speaker gets the entire transcript instead of
+    their own words. Per-word items (~0.1-0.5s each) are small enough to
+    actually discriminate between speaker turns.
+
     Returns None if there's nothing to align (mirrors _diarize_with_claude
     returning None for TEK_KONUSMACI / single-speaker audio) — same contract,
     same frontend handling either way.
     """
-    if not whisper_segments or not diar_segments:
+    if not whisper_words or not diar_segments:
         return None
 
     speaker_order: List[str] = []  # first-appearance order → "1. kişi", "2. kişi", ...
     labeled: List[tuple] = []
-    for seg in whisper_segments:
+    for word in whisper_words:
         best_speaker, best_overlap = None, 0.0
         for d in diar_segments:
-            overlap = min(seg["end"], d["end"]) - max(seg["start"], d["start"])
+            overlap = min(word["end"], d["end"]) - max(word["start"], d["start"])
             if overlap > best_overlap:
                 best_overlap, best_speaker = overlap, d["speaker"]
         if best_speaker is None:
             continue
         if best_speaker not in speaker_order:
             speaker_order.append(best_speaker)
-        labeled.append((best_speaker, seg["text"]))
+        labeled.append((best_speaker, word["text"]))
 
     if len(speaker_order) < 2:
         return None  # single speaker (or no confident overlap match)
@@ -641,7 +660,7 @@ def _align_and_format_diarization(
 
 
 def _format_speaker_timeline(
-    whisper_segments: List[dict], diar_segments: List[dict]
+    whisper_words: List[dict], diar_segments: List[dict]
 ) -> Optional[str]:
     """Render pyannote's own speaker turns as a timestamped timeline:
 
@@ -658,17 +677,26 @@ def _format_speaker_timeline(
     same-speaker run into a single block). Two separate turns from the same
     speaker — e.g. Speaker 0 talks, pauses, Speaker 0 talks again later —
     stay as two separate timeline blocks, because they ARE two separate
-    turns; that's what real per-turn timestamps are for. A Whisper segment
-    straddling a turn boundary can contribute its text to both neighboring
-    turns (simple "any overlap counts" match, same best-effort spirit as
-    _align_and_format_diarization's overlap matching) — acceptable for a
-    readability feature, not exact word-level alignment.
+    turns; that's what real per-turn timestamps are for.
+
+    whisper_words MUST be per-word granularity (see _transcribe_local), NOT
+    Whisper's own coarse segments. This was a real, shipped bug on real
+    multi-speaker audio: BatchedInferencePipeline can merge many VAD-
+    separated speech chunks into one giant Segment spanning most/all of the
+    clip, so with coarse segments every pyannote turn overlaps that same
+    giant segment's "any overlap counts" test and every "Speaker N" block
+    renders the ENTIRE transcript instead of just that turn's words — see
+    CLAUDE.md "Bilinen Kritik Sorunlar" for the incident. A stray word whose
+    span straddles a turn boundary can still contribute to both neighboring
+    turns (same best-effort "any overlap counts" matching as
+    _align_and_format_diarization) — harmless at word granularity since a
+    word is at most a few hundred ms wide.
 
     Returns None if there's nothing to render (fewer than 2 distinct
-    speakers, or no segments/turns) — same soft-fail contract as
+    speakers, or no words/turns) — same soft-fail contract as
     _align_and_format_diarization/_diarize_with_claude.
     """
-    if not whisper_segments or not diar_segments:
+    if not whisper_words or not diar_segments:
         return None
 
     speaker_order: List[str] = []  # first-appearance order → "Speaker 0", "Speaker 1", ...
@@ -682,8 +710,8 @@ def _format_speaker_timeline(
     lines: List[str] = []
     for turn in sorted(diar_segments, key=lambda d: d["start"]):
         overlapping_text = " ".join(
-            seg["text"] for seg in whisper_segments
-            if min(seg["end"], turn["end"]) - max(seg["start"], turn["start"]) > 0
+            word["text"] for word in whisper_words
+            if min(word["end"], turn["end"]) - max(word["start"], turn["start"]) > 0
         )
         if not overlapping_text:
             continue
@@ -796,7 +824,7 @@ async def transcribe_audio(
         # No EMERGENT_LLM_KEY, no OpenAI-size-driven chunking (faster-whisper
         # has no 25MB per-request limit — it processes the whole file itself).
         try:
-            raw_text, whisper_segments = _transcribe_local(contents, ext, lang_code, quality_mode)
+            raw_text, whisper_words = _transcribe_local(contents, ext, lang_code, quality_mode)
         except HTTPException:
             raise
         except Exception as e:
@@ -815,8 +843,8 @@ async def transcribe_audio(
         if enable_diarization:
             try:
                 diar_segments = _diarize_local(contents, ext)
-                diarized_text = _align_and_format_diarization(whisper_segments, diar_segments)
-                speaker_timeline = _format_speaker_timeline(whisper_segments, diar_segments)
+                diarized_text = _align_and_format_diarization(whisper_words, diar_segments)
+                speaker_timeline = _format_speaker_timeline(whisper_words, diar_segments)
             except Exception:
                 logger.exception("Local diarization failed")
 

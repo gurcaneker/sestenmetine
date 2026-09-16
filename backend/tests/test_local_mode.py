@@ -137,6 +137,58 @@ class TestAlignAndFormatDiarization:
             [{"start": 0.0, "end": 1.0, "text": "x"}], []
         ) is None
 
+    def test_many_short_alternating_turns_word_level(self, monkeypatch):
+        """Regression guard for the real-world bug: the original synthetic
+        tests here only ever used a handful of coarse, sentence-sized
+        "segments" as input, which never exercised what actually happens on
+        real audio — _transcribe_local hands this function per-WORD items,
+        and a real conversation has many short, rapidly-alternating turns.
+        This test builds a realistic ~16-turn back-and-forth at word
+        granularity and checks each speaker's merged text contains only
+        their own words, never the other speaker's or the whole transcript."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        # Two speakers trade very short turns every ~1s, word timestamps
+        # spaced 0.2s apart within a turn — realistic for fast dialogue.
+        turns = [
+            ("SPEAKER_00", ["Evet", "tabii", "ki"]),
+            ("SPEAKER_01", ["Emin", "misin?"]),
+            ("SPEAKER_00", ["Kesinlikle", "eminim."]),
+            ("SPEAKER_01", ["Peki", "o", "zaman."]),
+            ("SPEAKER_00", ["Başlayalım", "mı?"]),
+            ("SPEAKER_01", ["Olur,", "hazırım."]),
+            ("SPEAKER_00", ["Süper."]),
+            ("SPEAKER_01", ["Devam", "et."]),
+        ]
+        whisper_words = []
+        diar_segments = []
+        t = 0.0
+        for speaker, words in turns:
+            turn_start = t
+            for w in words:
+                whisper_words.append({"start": t, "end": t + 0.15, "text": w})
+                t += 0.2
+            diar_segments.append({"start": turn_start, "end": t, "speaker": speaker})
+            t += 0.3  # gap before next turn
+
+        result = server._align_and_format_diarization(whisper_words, diar_segments)
+        lines = result.split("\n")
+        assert len(lines) == len(turns)  # one merged block per contiguous same-speaker run
+
+        all_words = {w for _, words in turns for w in words}
+        for line, (speaker, expected_words) in zip(lines, turns):
+            label = "1. kişi" if speaker == "SPEAKER_00" else "2. kişi"
+            assert line.startswith(f"{label}: ")
+            spoken = line.split(": ", 1)[1]
+            for w in expected_words:
+                assert w in spoken
+            # No other turn's words leaked into this block, and it's not
+            # the full transcript (the original bug's symptom).
+            other_words = all_words - set(expected_words)
+            leaked = [w for w in other_words if w in spoken.split()]
+            assert not leaked, f"words from other turns leaked into: {spoken!r}"
+
 
 class TestFormatSpeakerTimeline:
     """Pure Python logic (turn-driven timestamp rendering) — no ML models
@@ -227,6 +279,59 @@ class TestFormatSpeakerTimeline:
         assert server._format_speaker_timeline(
             [{"start": 0.0, "end": 1.0, "text": "x"}], []
         ) is None
+
+    def test_realistic_many_alternating_turns_word_level(self, monkeypatch):
+        """Regression guard for the real-world bug (see CLAUDE.md 'Bilinen
+        Kritik Sorunlar'): on a real multi-speaker recording every "Speaker
+        N" block ended up containing the ENTIRE transcript, because the
+        caller passed coarse Whisper segments (which BatchedInferencePipeline
+        can merge into one giant Segment spanning the whole clip) instead of
+        per-word items. The unit tests above never caught this because they
+        only ever used a handful of already-word-sized "segments" as input.
+        This test uses a realistic ~16-turn rapid back-and-forth at true
+        word granularity and asserts each block contains only its own turn's
+        words — never another turn's words, and never the whole transcript."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        turns = [
+            ("SPEAKER_00", ["Evet", "tabii", "ki"]),
+            ("SPEAKER_01", ["Emin", "misin?"]),
+            ("SPEAKER_00", ["Kesinlikle", "eminim."]),
+            ("SPEAKER_01", ["Peki", "o", "zaman."]),
+            ("SPEAKER_00", ["Başlayalım", "mı?"]),
+            ("SPEAKER_01", ["Olur,", "hazırım."]),
+            ("SPEAKER_00", ["Süper."]),
+            ("SPEAKER_01", ["Devam", "et."]),
+        ]
+        whisper_words = []
+        diar_segments = []
+        t = 0.0
+        for speaker, words in turns:
+            turn_start = t
+            for w in words:
+                whisper_words.append({"start": t, "end": t + 0.15, "text": w})
+                t += 0.2
+            diar_segments.append({"start": turn_start, "end": t, "speaker": speaker})
+            t += 0.3
+
+        result = server._format_speaker_timeline(whisper_words, diar_segments)
+        lines = result.split("\n")
+        assert len(lines) == len(turns) * 4  # one 4-line block per turn, not merged
+
+        all_words = {w for _, words in turns for w in words}
+        for i, (speaker, expected_words) in enumerate(turns):
+            base = i * 4
+            assert lines[base] == f"Speaker {0 if speaker == 'SPEAKER_00' else 1}"
+            body = lines[base + 2]
+            for w in expected_words:
+                assert w in body
+            other_words = all_words - set(expected_words)
+            leaked = [w for w in other_words if w in body.split()]
+            assert not leaked, f"words from other turns leaked into: {body!r}"
+            # The exact symptom of the original bug: a block must never be
+            # the full transcript.
+            assert body != " ".join(w for _, words in turns for w in words)
 
     def test_does_not_mutate_diarized_text_format(self, monkeypatch):
         """Explicit regression guard: the new format must never look like
@@ -404,7 +509,57 @@ class TestLocalPipelineMocked:
         assert call_kwargs.get("vad_filter") is True
         assert call_kwargs.get("batch_size") == server.WHISPER_BATCH_SIZE
         assert raw_text == "Merhaba dünya"
+        # fake_segment has no real .words, so MagicMock's default empty
+        # __iter__ makes `words` empty and this exercises the coarse-segment
+        # fallback path (see next test for the normal, word-level path).
         assert segments == [{"start": 0.0, "end": 1.5, "text": "Merhaba dünya"}]
+
+    def test_transcribe_local_returns_word_level_not_coarse_segments_for_diarization(
+        self, monkeypatch
+    ):
+        """Regression guard for the real shipped bug (CLAUDE.md 'Bilinen
+        Kritik Sorunlar'): _transcribe_local's second return value feeds
+        diarization alignment (_align_and_format_diarization /
+        _format_speaker_timeline). It must be per-WORD items, not Whisper's
+        own coarse segments — BatchedInferencePipeline can merge many VAD-
+        separated speech chunks (i.e. many real speaker turns) into ONE
+        coarse Segment spanning most/all of a multi-speaker clip, which is
+        exactly the condition that made every diarization block render the
+        entire transcript. Here one coarse segment carries several real
+        words with distinct timestamps — the fix must surface those word
+        timestamps, not the one wide segment span."""
+        _fake_local_mode_env(monkeypatch)
+        server = _reload_server()
+
+        fake_words = [
+            MagicMock(start=0.0, end=0.3, word=" Evet "),
+            MagicMock(start=0.5, end=0.9, word=" tabii "),
+            MagicMock(start=5.0, end=5.4, word=" eminim. "),
+        ]
+        # One coarse segment spans the whole 0.0-5.4s range — the exact
+        # merge behavior documented for BatchedInferencePipeline.
+        fake_segment = MagicMock(start=0.0, end=5.4, text=" Evet tabii eminim. ")
+        fake_segment.words = fake_words
+        fake_pipeline_instance = MagicMock()
+        fake_pipeline_instance.transcribe.return_value = ([fake_segment], MagicMock())
+        fake_module = types.ModuleType("faster_whisper")
+        fake_module.WhisperModel = MagicMock(return_value=MagicMock())
+        fake_module.BatchedInferencePipeline = MagicMock(return_value=fake_pipeline_instance)
+
+        with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+            _raw_text, diarization_input = server._transcribe_local(
+                b"fake audio bytes", "wav", "tr", "standard"
+            )
+
+        assert diarization_input == [
+            {"start": 0.0, "end": 0.3, "text": "Evet"},
+            {"start": 0.5, "end": 0.9, "text": "tabii"},
+            {"start": 5.0, "end": 5.4, "text": "eminim."},
+        ]
+        # Explicitly not the one coarse segment span — that's the bug.
+        assert diarization_input != [
+            {"start": 0.0, "end": 5.4, "text": "Evet tabii eminim."}
+        ]
 
     def test_transcribe_local_breaks_lines_on_long_pauses(self, monkeypatch):
         """Integration check that _transcribe_local actually wires its

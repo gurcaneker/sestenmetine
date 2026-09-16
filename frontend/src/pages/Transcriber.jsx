@@ -720,18 +720,37 @@ function DiarizedText({ text }) {
 // blocks, repeated. Distinct from DiarizedText above: this is timestamped
 // (0-based "Speaker N", real start/end seconds per turn), that one is the
 // older, un-timestamped "N. kişi:" format (diarized_text).
+// Blocks are parsed by scanning for "Speaker N" / timestamp header lines
+// rather than assuming a fixed 4-line stride — a rigid stride previously
+// misaligned (and could silently swap start/end) if a block's body ever
+// spanned more than one line. See CLAUDE.md "Bilinen Kritik Sorunlar" for
+// the backend regression this was found alongside.
+const TIMESTAMP_LINE = /^\d+\.\d{2}$/;
+const SPEAKER_HEADER_LINE = /^Speaker\s+(\d+)$/i;
+
 function SpeakerTimeline({ text }) {
   const lines = text.split("\n");
   const blocks = [];
-  for (let i = 0; i + 3 < lines.length; i += 4) {
-    const match = lines[i].match(/^Speaker\s+(\d+)$/i);
-    if (!match) continue;
+  let i = 0;
+  while (i < lines.length) {
+    const headerMatch = lines[i].match(SPEAKER_HEADER_LINE);
+    if (!headerMatch || !TIMESTAMP_LINE.test(lines[i + 1] || "")) {
+      i += 1;
+      continue;
+    }
+    const start = lines[i + 1];
+    let j = i + 2;
+    while (j < lines.length && !TIMESTAMP_LINE.test(lines[j])) {
+      j += 1;
+    }
+    if (j >= lines.length) break; // no closing timestamp found — stop
     blocks.push({
-      num: parseInt(match[1], 10),
-      start: lines[i + 1],
-      body: lines[i + 2],
-      end: lines[i + 3],
+      num: parseInt(headerMatch[1], 10),
+      start,
+      body: lines.slice(i + 2, j).join("\n"),
+      end: lines[j],
     });
+    i = j + 1;
   }
 
   return (
